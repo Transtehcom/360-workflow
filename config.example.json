@@ -1,0 +1,30 @@
+{
+  "_comment": "Скопируйте этот файл в config.json и заполните. config.json в git не попадает: в нём адрес вебхука Битрикс24.",
+  "_timezone_comment": "Часовой пояс приложения (сроки оценок, время сессий, напоминания). Пустая строка — пояс системы. Пермь, Екатеринбург — Asia/Yekaterinburg (UTC+5).",
+  "timezone": "",
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8082,
+    "_public_url_comment": "Адрес, по которому участники открывают приложение. Он попадает в задачи и комментарии Битрикс24 как ссылка на анкету.",
+    "public_url": "https://360.transtehcom.ru:8443",
+    "_secure_cookie_comment": "true — если приложение открывают по HTTPS через обратный прокси",
+    "secure_cookie": false,
+    "_trust_proxy_comment": "true — приложение стоит за обратным прокси на этом же сервере (Caddy): адрес клиента берётся из X-Forwarded-For",
+    "trust_proxy": false,
+    "session_hours": 12,
+    "_open_browser_comment": "true — при запуске открывать приложение в браузере (для офисного ПК)",
+    "open_browser": true
+  },
+
+  "bitrix24": {
+    "_comment": "Входящий вебхук: Битрикс24 → Разработчикам → Другое → Входящий вебхук. Права: только task и user. Пустой адрес — задачи в Битрикс24 не создаются.",
+    "webhook": "",
+    "verify_ssl": true
+  },
+
+  "_reminder_days_comment": "Через сколько дней после выдачи анкеты напоминать оценивающему, если он её не отправил.",
+  "reminder_days": [7, 12],
+  "_default_deadline_days_comment": "Срок оценки по умолчанию, дней от даты запуска.",
+  "default_deadline_days": 14
+}

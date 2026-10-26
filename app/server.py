@@ -302,6 +302,9 @@ class Handler(BaseHTTPRequestHandler):
         with app.lock:
             if app.guard.blocked(key):
                 raise HttpError(429, "Слишком много неудачных попыток входа. Попробуйте через 15 минут")
+            # попытка засчитывается сразу, до хеширования: иначе одновременные запросы прошли бы проверку
+            # предела все вместе, пока ни один ещё не записал неудачу. Успешный вход снимает её через reset
+            app.guard.failed(key)
             row = auth.login_row(app.con, login)
         # PBKDF2 — вне общей блокировки: иначе каждая попытка входа на доли секунды останавливала бы все запросы
         h = auth.attempt_hash(row, password)
@@ -310,8 +313,7 @@ class Handler(BaseHTTPRequestHandler):
             user = auth.login_row(app.con, login)
             if (not isinstance(password, str) or row is None or user is None or user["salt"] != row["salt"]
                     or not auth.hash_matches(user, h)):
-                app.guard.failed(key)
-                raise HttpError(401, BAD_LOGIN)
+                raise HttpError(401, BAD_LOGIN)  # неудача уже засчитана до хеширования
             app.guard.reset(key)
             token = auth.new_session(app.con, user["id"], app.session_hours())
         self.cookie = self.cookie_header(token)

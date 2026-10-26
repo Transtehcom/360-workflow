@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -203,6 +204,49 @@ class AuthTest(ServerTestCase):
         code, _, _ = c.call("POST", "/api/login", {"login": "nat", "password": PASSWORD}, {"X-Forwarded-For": "10.9.9.9"})
         self.assertEqual(code, 429)
         self.assertEqual(len(self.app.guard.fails), 1)
+
+    def test_parallel_wrong_logins_respect_the_limit(self):
+        # попытки одновременно: пока считаются хеши первых, остальные тоже должны упереться в предел
+        n, real = 40, auth.hash_password
+        start = threading.Barrier(n)
+        codes, codes_lock = [], threading.Lock()
+
+        def slow_hash(password, salt=None):
+            time.sleep(0.2)  # окно между проверкой предела и итогом попытки — шире, чем время запуска потоков
+            return real(password, salt)
+
+        def attempt():
+            # соединение — заранее: одновременные подключения переполнили бы очередь приёма сокета
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+            try:
+                conn.connect()
+                start.wait()
+                conn.request("POST", "/api/login", body=json.dumps({"login": "nat", "password": "wrong-password"}),
+                             headers={"Content-Type": "application/json"})
+                resp = conn.getresponse()
+                resp.read()
+                with codes_lock:
+                    codes.append(resp.status)
+            finally:
+                conn.close()
+
+        with mock.patch("app.auth.hash_password", side_effect=slow_hash):
+            threads = [threading.Thread(target=attempt) for _ in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(len(codes), n)
+        self.assertEqual(set(codes) - {401, 429}, set())
+        self.assertLessEqual(sum(code != 429 for code in codes), auth.LOGIN_MAX_FAILS)
+        self.assertEqual(Client(self.port).login("nat")[0], 429)  # и верный пароль после этого не проходит
+
+    def test_successful_login_leaves_no_failed_attempt(self):
+        c = Client(self.port)
+        for _ in range(9):
+            self.assertEqual(c.login("nat", "wrong-password")[0], 401)
+        self.assertEqual(c.login("nat")[0], 200)  # попытка засчитана заранее и снята успехом
+        self.assertEqual(self.app.guard.fails, {})
 
     def lock_is_free(self):
         """Свободна ли общая блокировка для другого потока (RLock своего потока взялся бы всегда)."""

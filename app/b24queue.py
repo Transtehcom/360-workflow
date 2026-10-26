@@ -17,6 +17,15 @@ def enqueue(con, assignment_id, op, payload=None):
                 (assignment_id, op, json.dumps(payload or {}, ensure_ascii=False), now()))
 
 
+def has_task(con, assignment_id):
+    """Есть ли у анкеты задача: уже поставлена или ещё ставится (create не выполнен и не исчерпал попытки).
+    Только тогда есть смысл ставить в очередь остальные операции — им есть чего дождаться."""
+    return con.execute(
+        "SELECT 1 FROM assignments WHERE id=? AND b24_task_id IS NOT NULL UNION ALL "
+        "SELECT 1 FROM b24_ops WHERE assignment_id=? AND op='create' AND done_at IS NULL AND attempts < ?",
+        (assignment_id, assignment_id, MAX_ATTEMPTS)).fetchone() is not None
+
+
 def task_status(con, assignment_id):
     """Подпись для карточки оценки: что с задачей оценивающего в Битрикс24."""
     a = con.execute("SELECT a.b24_task_id, u.b24_user_id FROM assignments a JOIN users u ON u.id = a.user_id "

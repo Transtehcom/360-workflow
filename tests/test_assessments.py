@@ -84,11 +84,15 @@ class AssessmentsTest(unittest.TestCase):
     def test_task_status_labels(self):
         self.con.execute("UPDATE b24_ops SET last_error='timeout', attempts=3 WHERE assignment_id=?", (self.a_peer,))
         self.assertEqual(b24queue.task_status(self.con, self.a_peer), "ошибка Битрикс24: timeout")
+        self.assertIs(b24queue.has_task(self.con, self.a_peer), True)
         self.con.execute("UPDATE b24_ops SET attempts=? WHERE assignment_id=?", (b24queue.MAX_ATTEMPTS, self.a_peer))
         self.assertEqual(b24queue.task_status(self.con, self.a_peer), "задача не поставлена")
+        self.assertIs(b24queue.has_task(self.con, self.a_peer), False)
         self.con.execute("UPDATE b24_ops SET done_at='x' WHERE assignment_id=?", (self.a_peer,))
         self.con.execute("UPDATE assignments SET b24_task_id=500 WHERE id=?", (self.a_peer,))
         self.assertEqual(b24queue.task_status(self.con, self.a_peer), "задача поставлена")
+        self.assertIs(b24queue.has_task(self.con, self.a_peer), True)
+        self.assertIs(b24queue.has_task(self.con, self.a_client), False)
         with self.assertRaises(ValueError):
             b24queue.enqueue(self.con, self.a_peer, "delete")
 
@@ -244,6 +248,48 @@ class AssessmentsTest(unittest.TestCase):
         self.assertEqual([a["id"] for a in asm.list_assessments(self.con)], [second, self.aid])
         self.assertEqual(asm.get_assessment(self.con, self.aid)["status"], "cancelled")
         self.assertEqual(self.ops("comment")[-1], (self.a_peer, "comment", {"text": "Оценка отменена"}))
+        statuses = {r["status"] for r in asm.get_assessment(self.con, self.aid)["respondents"]}
+        self.assertEqual(statuses, {"closed"})
+
+    def test_closed_assessment_rejects_edits(self):
+        second = self.create(subject=self.petrov, respondents=[(self.ivanov, "peer")])
+        s_peer = self.assignment(self.ivanov, second)
+        asm.cancel_assessment(self.con, self.aid)
+        asm.finish_assessment(self.con, second)
+        for assignment_id, user_id in ((self.a_peer, self.petrov), (s_peer, self.ivanov)):
+            with self.subTest(assignment_id=assignment_id):
+                with self.assertRaisesRegex(Conflict, "Анкета уже отправлена или оценка закрыта"):
+                    asm.save_answer(self.con, assignment_id, user_id, "A1", 3)
+                with self.assertRaisesRegex(Conflict, "Анкета уже отправлена или оценка закрыта"):
+                    asm.submit(self.con, assignment_id, user_id)
+
+    def test_ops_follow_task_not_link(self):
+        # связь с Битрикс24 убрали после постановки задачи — задачу всё равно закрываем
+        self.con.execute("UPDATE b24_ops SET done_at='x' WHERE assignment_id=?", (self.a_peer,))
+        self.con.execute("UPDATE assignments SET b24_task_id=500 WHERE id=?", (self.a_peer,))
+        users.update_user(self.con, self.petrov, b24_user_id=None)
+        self.fill(self.a_peer, self.petrov, score_keys(False))
+        asm.submit(self.con, self.a_peer, self.petrov)
+        self.assertEqual(self.ops()[-1], (self.a_peer, "complete", {}))
+        # связь появилась после назначения — задачи нет, ставить нечего
+        users.update_user(self.con, self.client, b24_user_id=20)
+        self.fill(self.a_client, self.client, score_keys(False))
+        asm.submit(self.con, self.a_client, self.client)
+        self.assertEqual([o for o in self.ops() if o[0] == self.a_client], [])
+        # create исчерпал попытки — завершение не ставит операций, которым нечего ждать
+        self.con.execute("UPDATE b24_ops SET attempts=? WHERE assignment_id=?", (b24queue.MAX_ATTEMPTS, self.a_self))
+        before = len(self.ops())
+        asm.finish_assessment(self.con, self.aid)
+        self.assertEqual(len(self.ops()), before)
+
+    def test_remove_unlinked_with_task(self):
+        self.con.execute("UPDATE assignments SET b24_task_id=777 WHERE id=?", (self.a_peer,))
+        users.update_user(self.con, self.petrov, b24_user_id=None)
+        asm.remove_respondent(self.con, self.a_peer)
+        self.assertEqual(self.ops()[-2:], [
+            (self.a_peer, "comment", {"text": "Вы исключены из оценки", "task_id": 777}),
+            (self.a_peer, "complete", {"task_id": 777}),
+        ])
 
     def test_deadline_change_enqueues(self):
         self.fill(self.a_self, self.ivanov, score_keys(False))

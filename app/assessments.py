@@ -1,7 +1,8 @@
 """Оценки и анкеты: назначение, автосохранение ответов, отправка, возврат, завершение.
 
-Операции с задачами Битрикс24 ставятся в очередь (b24queue) только для оценивающих со связью
-с Битрикс24 — в той же транзакции, что и изменение анкеты."""
+Операции с задачами Битрикс24 ставятся в очередь (b24queue) в той же транзакции, что и изменение анкеты:
+create — только для оценивающих со связью с Битрикс24, остальные — только если у анкеты есть задача
+(b24queue.has_task)."""
 import contextlib
 import datetime as dt
 import re
@@ -85,11 +86,11 @@ def _active_assessment(con, assessment_id):
 
 
 def _assignment(con, assignment_id):
-    """Анкета вместе с оценкой, оцениваемым и связью оценивающего с Битрикс24."""
+    """Анкета вместе с оценкой и оцениваемым."""
     return con.execute(
-        "SELECT g.*, a.is_manager, a.deadline, a.status AS assessment_status, s.fio AS subject_fio, "
-        "u.b24_user_id FROM assignments g JOIN assessments a ON a.id = g.assessment_id "
-        "JOIN users s ON s.id = a.subject_id JOIN users u ON u.id = g.user_id WHERE g.id=?",
+        "SELECT g.*, a.is_manager, a.deadline, a.status AS assessment_status, s.fio AS subject_fio "
+        "FROM assignments g JOIN assessments a ON a.id = g.assessment_id "
+        "JOIN users s ON s.id = a.subject_id WHERE g.id=?",
         (assignment_id,)).fetchone()
 
 
@@ -195,16 +196,15 @@ def remove_respondent(con, assignment_id):
         # строки анкеты больше нет, поэтому ID задачи едет в payload;
         # если задачи ещё нет, process пропустит create удалённой анкеты
         task_id = g["b24_task_id"]
-        if task_id is not None and g["b24_user_id"] is not None:
+        if task_id is not None:
             b24queue.enqueue(con, assignment_id, "comment", {"text": "Вы исключены из оценки", "task_id": task_id})
             b24queue.enqueue(con, assignment_id, "complete", {"task_id": task_id})
 
 
-def _linked_drafts(con, assessment_id):
-    return [r["id"] for r in con.execute(
-        "SELECT g.id FROM assignments g JOIN users u ON u.id = g.user_id "
-        "WHERE g.assessment_id=? AND g.status='draft' AND u.b24_user_id IS NOT NULL ORDER BY g.id",
-        (assessment_id,))]
+def _drafts_with_task(con, assessment_id):
+    ids = [r["id"] for r in con.execute(
+        "SELECT id FROM assignments WHERE assessment_id=? AND status='draft' ORDER BY id", (assessment_id,))]
+    return [g for g in ids if b24queue.has_task(con, g)]
 
 
 def set_deadline(con, assessment_id, deadline):
@@ -212,14 +212,14 @@ def set_deadline(con, assessment_id, deadline):
     with _write(con):
         _active_assessment(con, assessment_id)
         con.execute("UPDATE assessments SET deadline=? WHERE id=?", (deadline, assessment_id))
-        for g in _linked_drafts(con, assessment_id):
+        for g in _drafts_with_task(con, assessment_id):
             b24queue.enqueue(con, g, "deadline", {"deadline": deadline})
 
 
 def _close(con, assessment_id, status, text):
     with _write(con):
         _active_assessment(con, assessment_id)
-        drafts = _linked_drafts(con, assessment_id)
+        drafts = _drafts_with_task(con, assessment_id)
         con.execute("UPDATE assessments SET status=?, closed_at=? WHERE id=?", (status, now(), assessment_id))
         con.execute("UPDATE assignments SET status='closed' WHERE assessment_id=? AND status='draft'",
                     (assessment_id,))
@@ -284,7 +284,7 @@ def submit(con, assignment_id, user_id):
         if missing:
             raise BadRequest("Не заполнены блоки: " + ", ".join(missing))
         con.execute("UPDATE assignments SET status='submitted', submitted_at=? WHERE id=?", (now(), assignment_id))
-        if g["b24_user_id"] is not None:
+        if b24queue.has_task(con, assignment_id):
             b24queue.enqueue(con, assignment_id, "complete")
 
 
@@ -297,6 +297,6 @@ def return_for_revision(con, assignment_id):
             raise Conflict("Вернуть можно только отправленную анкету, пока оценка идёт")
         con.execute("UPDATE assignments SET status='draft', submitted_at=NULL, returned_at=? WHERE id=?",
                     (now(), assignment_id))
-        if g["b24_user_id"] is not None:
+        if b24queue.has_task(con, assignment_id):
             b24queue.enqueue(con, assignment_id, "renew")
             b24queue.enqueue(con, assignment_id, "comment", {"text": "Анкета возвращена на доработку"})

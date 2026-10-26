@@ -1,4 +1,6 @@
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 import sys
@@ -9,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import assessments as asm, b24queue, users  # noqa: E402
-from app.bitrix24 import B24Error, B24Tasks  # noqa: E402
+from app.bitrix24 import B24Error, B24Tasks, Bitrix24  # noqa: E402
 from app.common import connect, today  # noqa: E402
 from app.questionnaire import score_keys  # noqa: E402
 
@@ -22,22 +24,30 @@ def day(offset):
 
 class FakeTasks:
     """Тот же интерфейс, что у B24Tasks: задачи — в словаре, вызовы — в журнале, сбои — по сценарию.
-    Каждый вызов проверяет, что блокировка базы в этот момент свободна."""
+    Каждый вызов проверяет, что блокировка базы в этот момент свободна; нарушения копятся в violations
+    (process перехватывает любые исключения, поэтому одного assert мало)."""
 
     def __init__(self, lock):
         self.lock = lock
+        self.violations = []
         self.tasks = {}
         self.calls = []
         self.fail = {}  # метод → сколько раз подряд упасть
+        self.crash = {}  # метод → сколько раз подряд упасть чужой ошибкой (не B24Error)
         self.after_add = None  # вызывается после создания задачи: может удалить анкету или «потерять ответ»
         self.next_id = 500
 
     def _call(self, method, *args):
-        assert self.lock is None or not self.lock.locked(), f"{method}: вызов Битрикс24 под блокировкой базы"
+        if self.lock is not None and self.lock.locked():
+            self.violations.append(method)
+            raise AssertionError(f"{method}: вызов Битрикс24 под блокировкой базы")
         self.calls.append((method, *args))
         if self.fail.get(method):
             self.fail[method] -= 1
             raise B24Error(f"{method}: сбой")
+        if self.crash.get(method):
+            self.crash[method] -= 1
+            raise RuntimeError("https://portal.example/rest/1/secret/")
 
     def find_task(self, responsible_id, title):
         self._call("find_task", responsible_id, title)
@@ -92,6 +102,7 @@ class QueueTest(unittest.TestCase):
         self.addCleanup(self.con.close)
         self.lock = threading.Lock()
         self.fake = FakeTasks(self.lock)
+        self.addCleanup(lambda: self.assertEqual(self.fake.violations, []))
         self.logged = []
         self.nat = users.create_user(self.con, "Наталья", "nat", "secret1", is_admin=True)
         self.ivanov = users.create_user(self.con, "Иванов Пётр", "ivanov", "secret1", b24_user_id=11)
@@ -212,6 +223,43 @@ class QueueTest(unittest.TestCase):
         asm.remove_respondent(self.con, self.a_peer)
         self.assertEqual(self.process(), {"done": 2, "failed": 0})
         self.assertEqual(self.fake.calls, [("comment", task_id, "Вы исключены из оценки"), ("complete", task_id)])
+
+    def test_removed_and_readded_gets_new_task(self):
+        # номер убранной анкеты не достаётся новой: иначе find_task нашёл бы старую закрытую задачу
+        self.process()
+        old_task = self.task_id(self.a_peer)
+        self.con.execute("UPDATE assignments SET sent_at='2026-10-01T10:00:00' WHERE id=?", (self.a_peer,))
+        self.con.commit()
+        self.assertEqual(b24queue.due_reminders(self.con, [7, 12], dt.date(2026, 10, 8)), 1)
+        asm.remove_respondent(self.con, self.assignment(self.client))
+        asm.remove_respondent(self.con, self.a_peer)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM reminders WHERE assignment_id=?",
+                                          (self.a_peer,)).fetchone()[0], 0)
+        again = asm.add_respondent(self.con, self.aid, self.petrov, "peer")
+        self.assertNotEqual(again, self.a_peer)
+        self.process()
+        new_task = self.task_id(again)
+        self.assertEqual(self.methods().count("add_task"), 2)
+        self.assertNotEqual(new_task, old_task)
+        self.assertEqual(self.fake.tasks[old_task]["status"], "closed")
+        self.assertEqual(self.fake.tasks[new_task]["status"], "open")
+        self.con.execute("UPDATE assignments SET sent_at='2026-10-01T10:00:00' WHERE id=?", (again,))
+        self.con.commit()
+        self.assertEqual(b24queue.due_reminders(self.con, [7, 12], dt.date(2026, 10, 8)), 1)
+
+    def test_unexpected_error_counts_attempt(self):
+        sidorov = users.create_user(self.con, "Сидоров Олег", "sidorov", "secret1", b24_user_id=13)
+        other = asm.add_respondent(self.con, self.aid, sidorov, "peer")
+        self.fake.crash["find_task"] = 1
+        self.assertEqual(self.process(), {"done": 1, "failed": 1})
+        create = self.con.execute("SELECT * FROM b24_ops WHERE assignment_id=? AND op='create'",
+                                  (self.a_peer,)).fetchone()
+        self.assertEqual((create["attempts"], create["last_error"]), (1, "внутренняя ошибка: RuntimeError"))
+        self.assertIsNotNone(self.task_id(other))  # очередь других анкет не встала
+        self.assertEqual(len(self.logged), 1)
+        self.assertNotIn("secret", self.logged[0])
+        self.assertEqual(self.process(), {"done": 1, "failed": 0})
+        self.assertIsNotNone(self.task_id(self.a_peer))
 
     def test_attempt_cap_and_retry(self):
         self.submit(self.a_peer, self.petrov)
@@ -340,6 +388,31 @@ class QueueTest(unittest.TestCase):
         worker.stop()
         self.assertFalse(worker.thread.is_alive())
 
+    def test_worker_survives_exception(self):
+        config = {"server": {"public_url": PUBLIC_URL}, "reminder_days": [7, 12],
+                  "bitrix24": {"webhook": "https://example.invalid/rest/1/x/"}}
+        self.fake.lock = None
+        worker = b24queue.Worker(self.con, self.lock, config, self.fake, log=self.logged.append)
+        self.addCleanup(worker.stop)
+        run_once, passes = worker.run_once, []
+
+        def flaky():
+            passes.append(1)
+            if len(passes) == 1:
+                raise RuntimeError("сбой прохода")
+            run_once()
+        worker.run_once = flaky
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            worker.start()
+            self.wait_for(lambda: passes)
+            self.assertIsNone(self.task_id(self.a_peer))
+            worker.wake()
+            self.wait_for(lambda: self.task_id(self.a_peer) is not None)
+            worker.stop()
+        self.assertIn("RuntimeError: сбой прохода", stderr.getvalue())
+        self.assertFalse(worker.thread.is_alive())
+
     def test_worker_not_started_without_webhook(self):
         config = {"server": {"public_url": PUBLIC_URL}, "reminder_days": [7, 12], "bitrix24": {"webhook": ""}}
         worker = b24queue.Worker(self.con, self.lock, config, self.fake)
@@ -393,6 +466,12 @@ class B24TasksTest(unittest.TestCase):
             ("tasks.task.renew", {"taskId": 43}),
             ("task.commentitem.add", {"TASKID": 43, "FIELDS": {"POST_MESSAGE": "Текст"}}),
         ])
+
+    def test_bad_webhook_hidden_in_error(self):
+        with self.assertRaises(B24Error) as cm:
+            Bitrix24({"webhook": "no-scheme/abc"}).call("profile")
+        self.assertIn("profile", str(cm.exception))
+        self.assertNotIn("no-scheme", str(cm.exception))
 
     def test_find_task_none_and_bad_answer(self):
         t = B24Tasks(FakeBitrix24(responses={"tasks.task.list": {"result": {"tasks": []}},

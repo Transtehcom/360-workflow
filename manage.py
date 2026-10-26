@@ -61,7 +61,7 @@ def main():
         try:
             b24 = Bitrix24(cfg)
             r = b24.call("profile")["result"]
-            print("Битрикс24: OK, вебхук от пользователя", r.get("NAME"), r.get("LAST_NAME"))
+            print("Битрикс24: OK, вебхук от пользователя", r.get("NAME") or "", r.get("LAST_NAME") or "")
             print("пользователей:", len(B24Tasks(b24).users()))
         except Exception as e:  # noqa
             print("Битрикс24: ошибка —", e)

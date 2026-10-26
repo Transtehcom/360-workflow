@@ -21,8 +21,11 @@ class Bitrix24:
     # ---------- транспорт
     def call(self, method, params=None):
         data = json.dumps(params or {}).encode("utf-8")
-        req = urllib.request.Request(self.url + method + ".json", data=data,
-                                     headers={"Content-Type": "application/json"})
+        try:
+            req = urllib.request.Request(self.url + method + ".json", data=data,
+                                         headers={"Content-Type": "application/json"})
+        except ValueError:  # текст ошибки содержит адрес вебхука — в журнал и карточку его не пускаем
+            raise B24Error(f"{method}: неверный адрес вебхука в config.json")
         for attempt in range(5):
             try:
                 with urllib.request.urlopen(req, timeout=60, context=self.ctx) as r:

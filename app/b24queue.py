@@ -178,12 +178,15 @@ def process(con, tasks, public_url, lock, log=print):
                 if not _task_op(con, tasks, lock, op):
                     stalled.add(op["assignment_id"])  # ждёт задачу; попыткой не считается
                     return
-        except B24Error as e:
+        except Exception as e:
+            # чужая ошибка (не B24Error) — тоже попытка: иначе операция заслонила бы очередь навсегда.
+            # Её текст может содержать адрес вебхука, поэтому пишется только тип
+            error = str(e)[:300] if isinstance(e, B24Error) else f"внутренняя ошибка: {type(e).__name__}"
             with lock:
-                con.execute("UPDATE b24_ops SET attempts=attempts+1, last_error=? WHERE id=?",
-                            (str(e)[:300], op["id"]))
+                con.rollback()
+                con.execute("UPDATE b24_ops SET attempts=attempts+1, last_error=? WHERE id=?", (error, op["id"]))
                 con.commit()
-            log(f"Битрикс24: {op['op']} по анкете №{op['assignment_id']} не выполнена — {e}")
+            log(f"Битрикс24: {op['op']} по анкете №{op['assignment_id']} не выполнена — {error}")
             result["failed"] += 1
             stalled.add(op["assignment_id"])
             return

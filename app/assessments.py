@@ -192,6 +192,7 @@ def remove_respondent(con, assignment_id):
         if g["status"] == "submitted":
             raise Conflict("Анкета уже отправлена — её нельзя убрать")
         con.execute("DELETE FROM answers WHERE assignment_id=?", (assignment_id,))
+        con.execute("DELETE FROM reminders WHERE assignment_id=?", (assignment_id,))
         con.execute("DELETE FROM assignments WHERE id=?", (assignment_id,))
         # строки анкеты больше нет, поэтому ID задачи едет в payload;
         # если задачи ещё нет, process пропустит create удалённой анкеты

@@ -55,15 +55,16 @@ CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT
 CREATE TABLE IF NOT EXISTS assessments (id INTEGER PRIMARY KEY, subject_id INTEGER NOT NULL, is_manager INTEGER NOT NULL,
   deadline TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_by INTEGER NOT NULL, created_at TEXT NOT NULL,
   closed_at TEXT);                                   -- status: active | finished | cancelled
-CREATE TABLE IF NOT EXISTS assignments (id INTEGER PRIMARY KEY, assessment_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-  role TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', sent_at TEXT NOT NULL, submitted_at TEXT,
-  returned_at TEXT, b24_task_id INTEGER, UNIQUE (assessment_id, user_id));
+-- AUTOINCREMENT: номер удалённой анкеты не достаётся новой — он стоит в названии задачи Битрикс24
+CREATE TABLE IF NOT EXISTS assignments (id INTEGER PRIMARY KEY AUTOINCREMENT, assessment_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', sent_at TEXT NOT NULL,
+  submitted_at TEXT, returned_at TEXT, b24_task_id INTEGER, UNIQUE (assessment_id, user_id));
                                                      -- status: draft | submitted | closed
 CREATE TABLE IF NOT EXISTS answers (assignment_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
   updated_at TEXT NOT NULL, PRIMARY KEY (assignment_id, key));
-CREATE TABLE IF NOT EXISTS b24_ops (id INTEGER PRIMARY KEY, assignment_id INTEGER NOT NULL, op TEXT NOT NULL,
-  payload TEXT NOT NULL DEFAULT '{}', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, done_at TEXT,
-  created_at TEXT NOT NULL);                         -- op: create | deadline | comment | complete | renew
+CREATE TABLE IF NOT EXISTS b24_ops (id INTEGER PRIMARY KEY AUTOINCREMENT, assignment_id INTEGER NOT NULL,
+  op TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+  done_at TEXT, created_at TEXT NOT NULL);           -- op: create | deadline | comment | complete | renew
 CREATE TABLE IF NOT EXISTS reminders (assignment_id INTEGER NOT NULL, day INTEGER NOT NULL, sent_at TEXT NOT NULL,
   PRIMARY KEY (assignment_id, day));
 """

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "360-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-B", "tests/preview_server.py", "--port", "8083"],
+      "port": 8083
+    }
+  ]
+}

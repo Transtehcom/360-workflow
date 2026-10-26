@@ -213,7 +213,9 @@ class AssessmentsTest(unittest.TestCase):
         self.assertEqual([m["assignment_id"] for m in asm.my_assignments(self.con, self.petrov)], [self.a_peer])
         a = asm.get_assignment(self.con, self.a_peer, self.viewer(self.petrov))
         self.assertEqual(len(a["answers"]), 50)
-        self.assertEqual(self.ops()[-2:], [(self.a_peer, "renew", {}),
+        # вместе с переоткрытием — текущий срок оценки: задача не остаётся со старым сроком
+        self.assertEqual(self.ops()[-3:], [(self.a_peer, "renew", {}),
+                                           (self.a_peer, "deadline", {"deadline": day(14)}),
                                            (self.a_peer, "comment", {"text": "Анкета возвращена на доработку"})])
         row = asm.get_assessment(self.con, self.aid)["respondents"][1]
         self.assertIsNone(row["submitted_at"])

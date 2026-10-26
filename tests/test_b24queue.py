@@ -4,7 +4,6 @@ import io
 import json
 import os
 import sys
-import threading
 import time
 import unittest
 
@@ -12,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import assessments as asm, b24queue, users  # noqa: E402
 from app.bitrix24 import B24Error, B24Tasks, Bitrix24  # noqa: E402
-from app.common import connect, today  # noqa: E402
+from app.common import connect, db_lock, today  # noqa: E402
 from app.questionnaire import score_keys  # noqa: E402
 
 PUBLIC_URL = "https://360.transtehcom.ru:8443"
@@ -24,7 +23,9 @@ def day(offset):
 
 class FakeTasks:
     """Тот же интерфейс, что у B24Tasks: задачи — в словаре, вызовы — в журнале, сбои — по сценарию.
-    Каждый вызов проверяет, что блокировка базы в этот момент свободна; нарушения копятся в violations
+    Каждый вызов проверяет, что вызывающий поток не держит общую блокировку базы (db_lock(), RLock).
+    У RLock нет locked(), а acquire из другого потока ловил бы и чужой захват, поэтому проверка —
+    _is_owned(): тот же метод, на который опирается threading.Condition. Нарушения копятся в violations
     (process перехватывает любые исключения, поэтому одного assert мало)."""
 
     def __init__(self, lock):
@@ -38,7 +39,7 @@ class FakeTasks:
         self.next_id = 500
 
     def _call(self, method, *args):
-        if self.lock is not None and self.lock.locked():
+        if self.lock is not None and self.lock._is_owned():
             self.violations.append(method)
             raise AssertionError(f"{method}: вызов Битрикс24 под блокировкой базы")
         self.calls.append((method, *args))
@@ -49,8 +50,8 @@ class FakeTasks:
             self.crash[method] -= 1
             raise RuntimeError("https://portal.example/rest/1/secret/")
 
-    def find_task(self, responsible_id, title):
-        self._call("find_task", responsible_id, title)
+    def find_task(self, responsible_id, title, created_at):
+        self._call("find_task", responsible_id, title, created_at)
         for task_id, t in self.tasks.items():
             if t["responsible_id"] == responsible_id and t["title"] == title:
                 return task_id
@@ -100,7 +101,7 @@ class QueueTest(unittest.TestCase):
     def setUp(self):
         self.con = connect(":memory:")
         self.addCleanup(self.con.close)
-        self.lock = threading.Lock()
+        self.lock = db_lock()  # та же блокировка, под которой пишут модули и сервер
         self.fake = FakeTasks(self.lock)
         self.addCleanup(lambda: self.assertEqual(self.fake.violations, []))
         self.logged = []
@@ -135,6 +136,26 @@ class QueueTest(unittest.TestCase):
             asm.save_answer(self.con, assignment_id, user_id, k, 4)
         asm.submit(self.con, assignment_id, user_id)
 
+    def exhaust_create(self):
+        self.fake.fail["add_task"] = b24queue.MAX_ATTEMPTS
+        for _ in range(b24queue.MAX_ATTEMPTS):
+            self.assertEqual(self.process(), {"done": 0, "failed": 1})
+        self.assertEqual(self.op("create")["attempts"], b24queue.MAX_ATTEMPTS)
+        self.assertEqual(b24queue.task_status(self.con, self.a_peer), "задача не поставлена")
+        self.fake.calls.clear()
+
+    def open_ops(self):
+        return self.con.execute("SELECT COUNT(*) FROM b24_ops WHERE done_at IS NULL").fetchone()[0]
+
+    def test_fake_detects_call_under_lock(self):
+        # проверка блокировки в FakeTasks действительно срабатывает на настоящей db_lock()
+        with self.lock:
+            with self.assertRaises(AssertionError):
+                self.fake.comment(1, "текст")
+        self.assertEqual(self.fake.violations, ["comment"])
+        self.fake.violations.clear()
+        self.fake.comment(1, "текст")  # без блокировки — можно
+
     def test_create_then_complete_flow(self):
         self.assertEqual(self.process(), {"done": 1, "failed": 0})
         task_id = self.task_id(self.a_peer)
@@ -142,7 +163,7 @@ class QueueTest(unittest.TestCase):
         title = f"Оценка 360°: Иванов Пётр (анкета №{self.a_peer})"
         d = dt.date.fromisoformat(self.deadline).strftime("%d.%m.%Y")
         self.assertEqual(self.fake.calls, [
-            ("find_task", 12, title),
+            ("find_task", 12, title, self.op("create")["created_at"]),
             ("add_task", 12, title,
              f"Пожалуйста, заполните анкету оценки 360° по сотруднику Иванов Пётр до {d}.\n"
              f"Анкета: {PUBLIC_URL}\nВойдите под логином, который выдала Наталья.", self.deadline),
@@ -173,18 +194,43 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(self.task_id(self.a_peer), next(iter(self.fake.tasks)))
 
     def test_ops_wait_for_create(self):
-        self.submit(self.a_peer, self.petrov)
+        asm.set_deadline(self.con, self.aid, day(20))
         self.fake.fail["add_task"] = 1
         self.assertEqual(self.process(), {"done": 0, "failed": 1})
         self.assertEqual(self.methods(), ["find_task", "add_task"])
-        self.assertEqual(self.op("complete")["attempts"], 0)
-        self.assertIsNone(self.op("complete")["done_at"])
+        self.assertEqual(self.op("deadline")["attempts"], 0)
+        self.assertIsNone(self.op("deadline")["done_at"])
         self.fake.calls.clear()
         self.assertEqual(self.process(), {"done": 2, "failed": 0})
         task_id = self.task_id(self.a_peer)
-        self.assertEqual(self.methods(), ["find_task", "add_task", "complete"])
-        self.assertEqual(self.fake.calls[-1], ("complete", task_id))
-        self.assertEqual(self.fake.tasks[task_id]["status"], "closed")
+        self.assertEqual(self.methods(), ["find_task", "add_task", "set_deadline"])
+        self.assertEqual(self.fake.calls[-1], ("set_deadline", task_id, day(20)))
+
+    def test_submitted_before_create_gets_no_task(self):
+        # анкету отправили, пока задача не поставилась: ставить её незачем, complete завершается «без задачи»
+        self.submit(self.a_peer, self.petrov)
+        self.assertEqual(self.process(), {"done": 2, "failed": 0})
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.open_ops(), 0)
+
+    def test_retry_after_exhausted_create_then_submit_opens_no_task(self):
+        self.exhaust_create()
+        self.submit(self.a_peer, self.petrov)
+        self.assertIsNone(self.op("complete"))  # задачи нет — закрывать нечего
+        b24queue.retry(self.con, self.a_peer)
+        self.assertEqual(self.process(), {"done": 1, "failed": 0})
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.fake.tasks, {})
+        self.assertEqual(self.open_ops(), 0)
+
+    def test_retry_after_exhausted_create_then_finish_opens_no_task(self):
+        self.exhaust_create()
+        asm.finish_assessment(self.con, self.aid)
+        b24queue.retry(self.con, self.a_peer)
+        self.assertEqual(self.process(), {"done": 1, "failed": 0})
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.fake.tasks, {})
+        self.assertEqual(self.open_ops(), 0)
 
     def test_removed_before_create(self):
         asm.remove_respondent(self.con, self.a_peer)
@@ -262,22 +308,37 @@ class QueueTest(unittest.TestCase):
         self.assertIsNotNone(self.task_id(self.a_peer))
 
     def test_attempt_cap_and_retry(self):
-        self.submit(self.a_peer, self.petrov)
-        self.fake.fail["add_task"] = b24queue.MAX_ATTEMPTS
-        for _ in range(b24queue.MAX_ATTEMPTS):
-            self.assertEqual(self.process(), {"done": 0, "failed": 1})
-        self.assertEqual(self.op("create")["attempts"], b24queue.MAX_ATTEMPTS)
-        self.fake.calls.clear()
+        asm.set_deadline(self.con, self.aid, day(20))
+        self.exhaust_create()
         self.assertEqual(self.process(), {"done": 0, "failed": 0})
         self.assertEqual(self.fake.calls, [])
-        self.assertEqual(self.op("complete")["attempts"], 0)
-        self.assertTrue(b24queue.task_status(self.con, self.a_peer).startswith("задача не поставлена"))
+        self.assertEqual(self.op("deadline")["attempts"], 0)
         b24queue.retry(self.con, self.a_peer)
         self.assertEqual(self.op("create")["attempts"], 0)
         self.assertIsNone(self.op("create")["last_error"])
         self.assertEqual(self.process(), {"done": 2, "failed": 0})
-        self.assertEqual(self.methods(), ["find_task", "add_task", "complete"])
+        self.assertEqual(self.methods(), ["find_task", "add_task", "set_deadline"])
         self.assertEqual(b24queue.task_status(self.con, self.a_peer), "задача поставлена")
+
+    def test_task_status_labels(self):
+        def status():
+            return b24queue.task_status(self.con, self.a_peer)
+        self.assertEqual(b24queue.task_status(self.con, self.assignment(self.client)), "не связан с Битрикс24")
+        self.assertEqual(status(), "ставится…")
+        self.fake.fail["add_task"] = 1
+        self.process()
+        self.assertEqual(status(), "ошибка Битрикс24: add_task: сбой")
+        self.process()
+        self.assertEqual(status(), "задача поставлена")
+        # операция над поставленной задачей ещё в очереди — задача всё равно поставлена
+        asm.set_deadline(self.con, self.aid, day(20))
+        self.assertEqual(status(), "задача поставлена")
+        self.fake.fail["set_deadline"] = 1
+        self.process()
+        self.assertEqual(status(), "ошибка Битрикс24: set_deadline: сбой")
+        self.con.execute("UPDATE b24_ops SET attempts=? WHERE op='deadline'", (b24queue.MAX_ATTEMPTS,))
+        self.con.commit()
+        self.assertEqual(status(), "задача не обновилась в Битрикс24")
 
     def test_failed_op_blocks_later_ops_of_same_assignment(self):
         self.process()
@@ -341,10 +402,13 @@ class QueueTest(unittest.TestCase):
         task_id = self.task_id(self.a_peer)
         self.submit(self.a_peer, self.petrov)
         self.process()
+        # срок сменили, пока анкета была отправлена: у её закрытой задачи он остался старым
+        asm.set_deadline(self.con, self.aid, day(25))
         self.fake.calls.clear()
         asm.return_for_revision(self.con, self.a_peer)
-        self.assertEqual(self.process(), {"done": 2, "failed": 0})
-        self.assertEqual(self.fake.calls, [("renew", task_id), ("comment", task_id, "Анкета возвращена на доработку")])
+        self.assertEqual(self.process(), {"done": 3, "failed": 0})
+        self.assertEqual(self.fake.calls, [("renew", task_id), ("set_deadline", task_id, day(25)),
+                                           ("comment", task_id, "Анкета возвращена на доработку")])
         self.assertEqual(len(self.fake.tasks), 1)
         self.assertEqual(self.fake.tasks[task_id]["status"], "open")
 
@@ -374,8 +438,7 @@ class QueueTest(unittest.TestCase):
     def test_worker_runs_pass_on_start_and_wake(self):
         config = {"server": {"public_url": PUBLIC_URL}, "reminder_days": [7, 12],
                   "bitrix24": {"webhook": "https://example.invalid/rest/1/x/"}}
-        # здесь блокировку держит и тестовый поток, поэтому проверку «вызов не под блокировкой» отключаем
-        self.fake.lock = None
+        # блокировку берёт и тестовый поток (wait_for), но проверка смотрит только на поток вызова
         worker = b24queue.Worker(self.con, self.lock, config, self.fake, log=self.logged.append)
         self.addCleanup(worker.stop)
         self.assertTrue(worker.start())
@@ -391,7 +454,6 @@ class QueueTest(unittest.TestCase):
     def test_worker_survives_exception(self):
         config = {"server": {"public_url": PUBLIC_URL}, "reminder_days": [7, 12],
                   "bitrix24": {"webhook": "https://example.invalid/rest/1/x/"}}
-        self.fake.lock = None
         worker = b24queue.Worker(self.con, self.lock, config, self.fake, log=self.logged.append)
         self.addCleanup(worker.stop)
         run_once, passes = worker.run_once, []
@@ -450,15 +512,17 @@ class B24TasksTest(unittest.TestCase):
             "tasks.task.add": {"result": {"task": {"id": "43"}}},
         })
         t = B24Tasks(b24)
-        self.assertEqual(t.find_task(12, "Оценка 360°: Иванов Пётр (анкета №1)"), 42)
+        self.assertEqual(t.find_task(12, "Оценка 360°: Иванов Пётр (анкета №1)", "2026-10-26T09:30:00"), 42)
         self.assertEqual(t.add_task(12, "Заголовок", "Описание", "2026-11-09"), 43)
         t.set_deadline(43, "2026-11-20")
         t.complete(43)
         t.renew(43)
         t.comment(43, "Текст")
         self.assertEqual(b24.calls, [
-            ("tasks.task.list", {"filter": {"RESPONSIBLE_ID": 12, "TITLE": "Оценка 360°: Иванов Пётр (анкета №1)"},
-                                 "select": ["ID"]}),
+            # старую задачу с тем же названием (база создана заново) не подхватываем: только созданные
+            # не раньше чем за сутки до операции create
+            ("tasks.task.list", {"filter": {"RESPONSIBLE_ID": 12, "TITLE": "Оценка 360°: Иванов Пётр (анкета №1)",
+                                            ">=CREATED_DATE": "2026-10-25T09:30:00"}, "select": ["ID"]}),
             ("tasks.task.add", {"fields": {"TITLE": "Заголовок", "DESCRIPTION": "Описание", "RESPONSIBLE_ID": 12,
                                            "DEADLINE": "2026-11-09T23:59:00"}}),
             ("tasks.task.update", {"taskId": 43, "fields": {"DEADLINE": "2026-11-20T23:59:00"}}),
@@ -476,7 +540,7 @@ class B24TasksTest(unittest.TestCase):
     def test_find_task_none_and_bad_answer(self):
         t = B24Tasks(FakeBitrix24(responses={"tasks.task.list": {"result": {"tasks": []}},
                                              "tasks.task.add": {"result": {"task": None}}}))
-        self.assertIsNone(t.find_task(12, "нет такой"))
+        self.assertIsNone(t.find_task(12, "нет такой", "2026-10-26T09:30:00"))
         with self.assertRaises(B24Error):
             t.add_task(12, "Заголовок", "Описание", "2026-11-09")
 

@@ -40,14 +40,17 @@ def task_status(con, assignment_id):
                     "WHERE a.id=?", (assignment_id,)).fetchone()
     if not a or a["b24_user_id"] is None:
         return "не связан с Битрикс24"
-    pending = con.execute("SELECT attempts, last_error FROM b24_ops WHERE assignment_id=? AND done_at IS NULL "
+    pending = con.execute("SELECT op, attempts, last_error FROM b24_ops WHERE assignment_id=? AND done_at IS NULL "
                           "ORDER BY id", (assignment_id,)).fetchall()
-    if any(p["attempts"] >= MAX_ATTEMPTS for p in pending):
+    exhausted = [p for p in pending if p["attempts"] >= MAX_ATTEMPTS]
+    if any(p["op"] == "create" for p in exhausted):
         return "задача не поставлена"
-    failed = [p for p in pending if p["last_error"]]
+    if exhausted and a["b24_task_id"] is not None:
+        return "задача не обновилась в Битрикс24"
+    failed = [p for p in pending if p["last_error"] and p["attempts"] < MAX_ATTEMPTS]
     if failed:
         return f"ошибка Битрикс24: {failed[0]['last_error']}"
-    if pending:
+    if any(p["op"] == "create" for p in pending):
         return "ставится…"
     if a["b24_task_id"] is not None:
         return "задача поставлена"
@@ -103,17 +106,21 @@ def _create(con, tasks, public_url, lock, op):
     aid = op["assignment_id"]
     with lock:
         g = con.execute(
-            "SELECT g.b24_task_id, u.b24_user_id, s.fio AS subject_fio, a.deadline FROM assignments g "
-            "JOIN users u ON u.id = g.user_id JOIN assessments a ON a.id = g.assessment_id "
-            "JOIN users s ON s.id = a.subject_id WHERE g.id=?", (aid,)).fetchone()
-        if not g or g["b24_task_id"] is not None or g["b24_user_id"] is None:
-            # анкету убрали, задача уже есть или связь с Битрикс24 сняли — ставить нечего
+            "SELECT g.b24_task_id, g.status, a.status AS assessment_status, u.b24_user_id, s.fio AS subject_fio, "
+            "a.deadline FROM assignments g JOIN users u ON u.id = g.user_id "
+            "JOIN assessments a ON a.id = g.assessment_id JOIN users s ON s.id = a.subject_id WHERE g.id=?",
+            (aid,)).fetchone()
+        if (not g or g["b24_task_id"] is not None or g["b24_user_id"] is None
+                or g["status"] != "draft" or g["assessment_status"] != "active"):
+            # анкету убрали, задача уже есть, связь с Битрикс24 сняли, анкету отправили или оценку закрыли —
+            # ставить нечего. Отправка и закрытие без задачи не ставят complete в очередь: поставленную сейчас
+            # задачу никто бы не закрыл. Операции за этой завершатся в _task_op как «задачи нет»
             _finish(con, op["id"])
             con.commit()
             return None
     title = task_title(g["subject_fio"], aid)
     # задача могла поставиться, а ответ — потеряться: сначала ищем её, чтобы не завести вторую
-    task_id = tasks.find_task(g["b24_user_id"], title)
+    task_id = tasks.find_task(g["b24_user_id"], title, op["created_at"])
     if task_id is None:
         task_id = tasks.add_task(g["b24_user_id"], title,
                                  task_description(g["subject_fio"], g["deadline"], public_url), g["deadline"])

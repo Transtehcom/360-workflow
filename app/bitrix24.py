@@ -1,6 +1,7 @@
 """Клиент входящего вебхука Битрикс24 и задачи анкет (только нужные методы).
 
 Права вебхука — только task и user: user.get, tasks.task.add/list/update/complete/renew, task.commentitem.add."""
+import datetime as dt
 import http.client
 import json
 import ssl
@@ -96,9 +97,13 @@ class B24Tasks:
         out.sort(key=lambda u: (u["name"].casefold(), u["id"]))
         return out
 
-    def find_task(self, responsible_id, title):
-        res = self.b24.call("tasks.task.list", {"filter": {"RESPONSIBLE_ID": responsible_id, "TITLE": title},
-                                                "select": ["ID"]})
+    def find_task(self, responsible_id, title, created_at):
+        """Задача анкеты по ответственному и названию. Только созданные не раньше чем за сутки до операции
+        create (created_at — её отметка времени): после пересоздания базы номера анкет идут заново, и старая
+        закрытая задача с тем же названием не подхватится. Сутки запаса покрывают разницу часовых поясов."""
+        since = (dt.datetime.fromisoformat(created_at) - dt.timedelta(days=1)).isoformat(timespec="seconds")
+        res = self.b24.call("tasks.task.list", {"filter": {"RESPONSIBLE_ID": responsible_id, "TITLE": title,
+                                                           ">=CREATED_DATE": since}, "select": ["ID"]})
         tasks = (res.get("result") or {}).get("tasks") or []
         if not tasks:
             return None

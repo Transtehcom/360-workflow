@@ -300,4 +300,6 @@ def return_for_revision(con, assignment_id):
                     (now(), assignment_id))
         if b24queue.has_task(con, assignment_id):
             b24queue.enqueue(con, assignment_id, "renew")
+            # пока анкета была отправлена, смена срока её задачу не трогала: срок — текущий срок оценки
+            b24queue.enqueue(con, assignment_id, "deadline", {"deadline": g["deadline"]})
             b24queue.enqueue(con, assignment_id, "comment", {"text": "Анкета возвращена на доработку"})

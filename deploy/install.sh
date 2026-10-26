@@ -11,7 +11,15 @@ REPO=https://github.com/Transtehcom/360-workflow.git
 [ "$(id -u)" -eq 0 ] || { echo "Запустите через sudo"; exit 1; }
 
 apt-get update -q
-apt-get install -y -q python3 git sqlite3 caddy
+apt-get install -y -q python3 git sqlite3
+if ! apt-get install -y -q caddy; then
+    # Caddy нет в репозиториях Ubuntu — ставим из официального репозитория Caddy
+    apt-get install -y -q debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -q
+    apt-get install -y -q caddy
+fi
 python3 -c 'import sqlite3, sys; assert sys.version_info >= (3, 10), "Нужен Python 3.10 или новее"'
 id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --home-dir "$APP_DIR" --no-create-home --shell /usr/sbin/nologin "$APP_USER"
 if [ -d "$APP_DIR/.git" ]; then
@@ -28,7 +36,8 @@ if [ ! -f "$APP_DIR/config.json" ]; then
     cp "$APP_DIR/config.example.json" "$APP_DIR/config.json"
     echo "Создан config.json. Для переноса ответов скопируйте также data/360.sqlite при остановленном приложении."
 fi
-cp "$APP_DIR/config.json" "$APP_DIR/config.json.before-install"
+# Копия настроек делается один раз: повторный запуск не затирает исходный файл.
+[ -f "$APP_DIR/config.json.before-install" ] || cp -p "$APP_DIR/config.json" "$APP_DIR/config.json.before-install"
 chown "root:$APP_USER" "$APP_DIR/config.json" "$APP_DIR/config.json.before-install"
 chmod 640 "$APP_DIR/config.json" "$APP_DIR/config.json.before-install"
 PORT=$(python3 - "$APP_DIR/config.json" "$DOMAIN" "$HTTPS_PORT" <<'PY'
@@ -43,7 +52,6 @@ if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
 suffix = "" if int(sys.argv[3]) == 443 else ":" + str(int(sys.argv[3]))
 server.update(host="127.0.0.1", secure_cookie=True, trust_proxy=True, open_browser=False,
               public_url="https://" + sys.argv[2] + suffix)
-config.setdefault("timezone", "Asia/Yekaterinburg")
 path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 print(port)
 PY
@@ -71,6 +79,10 @@ if ! grep -q '^# 360-workflow:' /etc/caddy/Caddyfile 2>/dev/null; then
     fi
 else
     echo "Сайт 360-workflow уже есть в Caddyfile. При смене домена или порта обновите его вручную."
+    if awk '/^# 360-workflow:/{f=1} f' /etc/caddy/Caddyfile | grep -q '127\.0\.0\.1:18082'; then
+        echo "ВНИМАНИЕ: блок 360-workflow всё ещё указывает на 127.0.0.1:18082 — трафик идёт на офисный туннель."
+        echo "Замените порт на 127.0.0.1:$PORT в /etc/caddy/Caddyfile вручную, затем: caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl reload caddy"
+    fi
     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 fi
 install -m 644 "$APP_DIR/deploy/360-workflow.service" /etc/systemd/system/360-workflow.service

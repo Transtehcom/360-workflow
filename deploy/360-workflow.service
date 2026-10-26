@@ -1,0 +1,23 @@
+[Unit]
+Description=Оценка сотрудников 360°
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=s360
+Group=s360
+WorkingDirectory=/opt/360-workflow
+ExecStart=/usr/bin/python3 -B -u manage.py run
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/360-workflow/data
+
+[Install]
+WantedBy=multi-user.target

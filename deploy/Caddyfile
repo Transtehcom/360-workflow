@@ -1,0 +1,16 @@
+# 360-workflow: Оценка 360° за HTTPS. Дописать этот блок в Caddyfile, сохранив другие сайты.
+# Для офиса PORT = 18082; для Ubuntu PORT = 8082. DOMAIN заменяется доменом с портом HTTPS.
+DOMAIN {
+    encode gzip
+    reverse_proxy 127.0.0.1:PORT
+    handle_errors {
+        @unavailable expression `{err.status_code} >= 500`
+        respond @unavailable "Оценка 360° временно недоступна. Попробуйте позже." 503
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+}

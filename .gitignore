@@ -9,3 +9,5 @@ python/
 
 __pycache__/
 *.pyc
+python-download.zip
+config.json.before-install

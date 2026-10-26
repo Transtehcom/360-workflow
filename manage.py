@@ -3,6 +3,7 @@
   python manage.py run                 — запустить веб-сервер
   python manage.py create-admin ЛОГИН  — создать администратора (ФИО и пароль спросит)
   python manage.py password ЛОГИН      — задать пароль пользователю
+  python manage.py check               — проверить подключение к Битрикс24
 """
 import getpass
 import sys
@@ -51,6 +52,19 @@ def main():
         except BadRequest as e:
             sys.exit(str(e))
         print("Пароль сохранён")
+    elif cmd == "check":
+        from app.bitrix24 import B24Tasks, Bitrix24
+        from app.common import load_config
+        cfg = load_config()["bitrix24"]
+        if not cfg.get("webhook"):
+            sys.exit("Битрикс24: адрес вебхука не задан в config.json")
+        try:
+            b24 = Bitrix24(cfg)
+            r = b24.call("profile")["result"]
+            print("Битрикс24: OK, вебхук от пользователя", r.get("NAME"), r.get("LAST_NAME"))
+            print("пользователей:", len(B24Tasks(b24).users()))
+        except Exception as e:  # noqa
+            print("Битрикс24: ошибка —", e)
     else:
         print(__doc__)
 

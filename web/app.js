@@ -67,8 +67,26 @@ function generatePassword(length = 10, random = n => crypto.getRandomValues(new 
   return Array.from(random(length), value => PASSWORD_ALPHABET[value % PASSWORD_ALPHABET.length]).join("");
 }
 
+// Запрос к API. POST — с keepalive: сохранение ответа при закрытии вкладки (pagehide) доходит до сервера.
+// Предел keepalive — 64 КБ тела, ответ ограничен 5000 символами.
+function fetchOptions(body, signal) {
+  const post = body !== undefined;
+  return {
+    method: post ? "POST" : "GET",
+    headers: post ? { "Content-Type": "application/json" } : {},
+    body: post ? JSON.stringify(body) : undefined,
+    keepalive: post, credentials: "same-origin", cache: "no-store", signal,
+  };
+}
+
+// «Повторить» у оценивающего. После завершения или отмены оценки новую задачу сервер не поставит,
+// поэтому кнопка остаётся только для задачи, которая есть, но не обновилась.
+function canRetry(taskStatus, active, b24Enabled) {
+  return b24Enabled && /ошибка|не поставлена|не обновилась/.test(taskStatus) && (active || !/не поставлена/.test(taskStatus));
+}
+
 // Проверка очереди средствами Node не требует браузера и внешних библиотек.
-if (typeof module !== "undefined" && module.exports) module.exports = { DraftSaver, generatePassword, PASSWORD_ALPHABET };
+if (typeof module !== "undefined" && module.exports) module.exports = { DraftSaver, generatePassword, PASSWORD_ALPHABET, fetchOptions, canRetry };
 
 if (typeof document !== "undefined") (() => {
   const root = document.querySelector("#app");
@@ -99,12 +117,7 @@ if (typeof document !== "undefined") (() => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 20000);
     try {
-      const response = await fetch(path, {
-        method: body === undefined ? "GET" : "POST",
-        headers: body === undefined ? {} : { "Content-Type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        credentials: "same-origin", cache: "no-store", signal: controller.signal,
-      });
+      const response = await fetch(path, fetchOptions(body, controller.signal));
       if (response.status === 401 && path !== "/api/login") loginRequired();
       if (attachment && response.ok) return { blob: await response.blob(), header: response.headers.get("Content-Disposition") };
       // Ответ прокси или шлюза может быть не JSON (например, HTML-страница 502).
@@ -225,7 +238,7 @@ if (typeof document !== "undefined") (() => {
   function renderAssessment(a, users) {
     const active = a.status === "active";
     root.innerHTML = `<a class="back" href="#admin">← Все оценки</a><div class="intro between"><div><p class="eyebrow">${a.is_manager ? "Оценка руководителя" : "Оценка сотрудника"}</p><h1>${esc(a.subject_fio)}</h1><div class="actions">${tag(a.status, assessmentStatus)}<span class="muted">До ${date(a.deadline)} · заполнили ${a.submitted} из ${a.total}</span></div></div><button data-download="${a.id}" class="primary">Итоги .xlsx</button></div>
-      <section class="panel"><h2>Оценивающие</h2>${errorBox()}<div class="table-wrap"><table><thead><tr><th>Участник</th><th>Анкета</th><th>Битрикс24</th><th>Действия</th></tr></thead><tbody>${a.respondents.map(r => `<tr><td><strong>${esc(r.fio)}</strong><div class="muted">${esc(r.role_title)}</div></td><td>${tag(r.status, answerStatus)}${r.returned_at && r.status === "draft" ? '<div class="muted">Возвращена на доработку</div>' : ""}</td><td data-label="Битрикс24">${esc(r.task_status)}</td><td><div class="actions"><a class="button small" href="#a/${r.assignment_id}?back=${a.id}">Просмотреть</a>${active && r.status === "submitted" ? `<button class="small" data-op="return" data-id="${r.assignment_id}">Вернуть на доработку</button>` : ""}${active && r.status === "draft" ? `<button class="small danger" data-op="remove" data-id="${r.assignment_id}">Убрать</button>` : ""}${active && me.b24_enabled && /ошибка|не поставлена|не обновилась/.test(r.task_status) ? `<button class="small" data-op="retry" data-id="${r.assignment_id}">Повторить</button>` : ""}</div></td></tr>`).join("")}</tbody></table></div></section>
+      <section class="panel"><h2>Оценивающие</h2>${errorBox()}<div class="table-wrap"><table><thead><tr><th>Участник</th><th>Анкета</th><th>Битрикс24</th><th>Действия</th></tr></thead><tbody>${a.respondents.map(r => `<tr><td><strong>${esc(r.fio)}</strong><div class="muted">${esc(r.role_title)}</div></td><td>${tag(r.status, answerStatus)}${r.returned_at && r.status === "draft" ? '<div class="muted">Возвращена на доработку</div>' : ""}</td><td data-label="Битрикс24">${esc(r.task_status)}</td><td><div class="actions"><a class="button small" href="#a/${r.assignment_id}?back=${a.id}">Просмотреть</a>${active && r.status === "submitted" ? `<button class="small" data-op="return" data-id="${r.assignment_id}">Вернуть на доработку</button>` : ""}${active && r.status === "draft" ? `<button class="small danger" data-op="remove" data-id="${r.assignment_id}">Убрать</button>` : ""}${canRetry(r.task_status, active, me.b24_enabled) ? `<button class="small" data-op="retry" data-id="${r.assignment_id}">Повторить</button>` : ""}</div></td></tr>`).join("")}</tbody></table></div></section>
       ${active ? `<section class="panel"><h2>Добавить оценивающего</h2><form id="add-form" class="stack"><div class="form-grid"><label>Участник<select name="user_id" required>${userOptions(users.filter(u => !a.respondents.some(r => r.user_id === u.id)))}</select></label><label>Роль<select name="role">${roleOptions()}</select></label></div>${errorBox()}<div><button type="submit">Добавить</button></div></form></section><section class="panel"><h2>Управление оценкой</h2><form id="deadline-form" class="stack"><label>Срок<input type="date" name="deadline" value="${a.deadline}" required></label>${errorBox()}<div><button type="submit">Изменить срок</button></div></form><hr><p class="muted">При завершении или отмене незаполненные анкеты закрываются. Отправленные ответы сохраняются.</p><div class="actions"><button data-close="finish">Завершить оценку</button><button class="danger" data-close="cancel">Отменить оценку</button></div></section>` : ""}`;
     bindDownloads();
     if (active) {

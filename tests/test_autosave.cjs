@@ -1,7 +1,7 @@
 // Проверяем порядок сохранения и восстановление после сбоя, а не детали DOM.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { DraftSaver, generatePassword, PASSWORD_ALPHABET } = require('../web/app.js');
+const { DraftSaver, generatePassword, PASSWORD_ALPHABET, canRetry, fetchOptions } = require('../web/app.js');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 test('медленный запрос не затирает более новый ответ; одновременно работает один запрос', async () => {
@@ -105,4 +105,39 @@ test('пароль для участника: 10 читаемых символо
   const all = generatePassword(PASSWORD_ALPHABET.length, n => Uint32Array.from({ length: n }, (_, i) => i));
   assert.equal(all, PASSWORD_ALPHABET);
   assert.equal(new Set(PASSWORD_ALPHABET).size, PASSWORD_ALPHABET.length);
+});
+
+test('POST уходит с keepalive и типом JSON: сохранение при закрытии вкладки не обрывается', () => {
+  const signal = new AbortController().signal;
+  const post = fetchOptions({ key: 'O1', value: 'текст' }, signal);
+  assert.equal(post.method, 'POST');
+  assert.equal(post.keepalive, true);
+  assert.deepEqual(post.headers, { 'Content-Type': 'application/json' });
+  assert.equal(post.body, JSON.stringify({ key: 'O1', value: 'текст' }));
+  assert.equal(post.signal, signal);
+  assert.equal(post.credentials, 'same-origin');
+  assert.equal(post.cache, 'no-store');
+  // пустое тело (выход, отправка анкеты) — тоже JSON-тип
+  assert.deepEqual(fetchOptions({}, signal).headers, { 'Content-Type': 'application/json' });
+  const get = fetchOptions(undefined, signal);
+  assert.equal(get.method, 'GET');
+  assert.equal(get.body, undefined);
+  assert.notEqual(get.keepalive, true);
+  assert.deepEqual(get.headers, {});
+  // предел keepalive — 64 КБ: самый длинный ответ (5000 символов кириллицей) далеко не доходит
+  assert.ok(Buffer.byteLength(fetchOptions({ key: 'extra', value: 'я'.repeat(5000) }, signal).body) < 64 * 1024);
+});
+
+test('«Повторить»: после закрытия оценки — только для поставленной задачи, которая не обновилась', () => {
+  for (const status of ['ошибка Битрикс24: сбой', 'задача не поставлена', 'задача не обновилась в Битрикс24']) {
+    assert.equal(canRetry(status, true, true), true, status);
+    assert.equal(canRetry(status, true, false), false, status);  // Битрикс24 не подключён
+  }
+  assert.equal(canRetry('задача не обновилась в Битрикс24', false, true), true);
+  assert.equal(canRetry('ошибка Битрикс24: сбой', false, true), true);
+  assert.equal(canRetry('задача не поставлена', false, true), false);
+  for (const status of ['задача поставлена', 'ставится…', 'не связан с Битрикс24']) {
+    assert.equal(canRetry(status, true, true), false, status);
+    assert.equal(canRetry(status, false, true), false, status);
+  }
 });

@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -68,6 +69,21 @@ class AuthTest(unittest.TestCase):
         self.assertFalse(g.blocked(("1.2.3.4", "petrov")))
         g.reset(k)
         self.assertFalse(g.blocked(k))
+
+
+class LoginGuardSweepTest(unittest.TestCase):
+    def test_login_guard_sweeps_expired_keys_of_all_logins(self):
+        g = auth.LoginGuard()
+        with mock.patch("app.auth.time.monotonic", return_value=1000.0):
+            for i in range(auth.SWEEP_FROM + 1):  # ключи, которые больше никто не проверит
+                g.failed(("1.2.3.4", f"login{i}"))
+            self.assertEqual(len(g.fails), auth.SWEEP_FROM + 1)  # свежие ключи чистка не трогает
+        with mock.patch("app.auth.time.monotonic", return_value=1000.0 + auth.LOGIN_WINDOW - 1):
+            g.failed(("1.2.3.4", "fresh-a"))
+            self.assertEqual(len(g.fails), auth.SWEEP_FROM + 2)  # окно ещё не прошло
+        with mock.patch("app.auth.time.monotonic", return_value=1000.0 + auth.LOGIN_WINDOW + auth.SWEEP_EVERY + 10):
+            g.failed(("1.2.3.4", "fresh-b"))
+        self.assertEqual(sorted(g.fails), [("1.2.3.4", "fresh-a"), ("1.2.3.4", "fresh-b")])
 
 
 if __name__ == "__main__":

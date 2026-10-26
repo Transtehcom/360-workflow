@@ -9,6 +9,8 @@ from .common import db_lock, now
 
 LOGIN_MAX_FAILS = 10
 LOGIN_WINDOW = 15 * 60
+SWEEP_FROM = 1000  # столько ключей в LoginGuard терпим, прежде чем вычищать просроченные
+SWEEP_EVERY = 60  # секунд: чаще чистка не идёт, чтобы наплыв новых ключей не заставлял обходить словарь каждый раз
 
 
 def hash_password(password, salt=None):
@@ -22,6 +24,14 @@ class LoginGuard:
 
     def __init__(self):
         self.fails = {}  # (ip, login) -> [время неудачных попыток]
+        self.swept = float("-inf")  # момент последней чистки
+
+    def sweep(self):
+        """Удаляет ключи, у которых последняя неудача старше окна: сами по себе они не очистятся,
+        пока тот же ключ не проверят снова."""
+        t = self.swept = time.monotonic()
+        for key in [k for k, v in self.fails.items() if t - v[-1] >= LOGIN_WINDOW]:
+            del self.fails[key]
 
     def blocked(self, key):
         t = time.monotonic()
@@ -34,6 +44,8 @@ class LoginGuard:
 
     def failed(self, key):
         self.fails.setdefault(key, []).append(time.monotonic())
+        if len(self.fails) > SWEEP_FROM and time.monotonic() - self.swept >= SWEEP_EVERY:
+            self.sweep()
 
     def reset(self, key):
         self.fails.pop(key, None)

@@ -370,6 +370,8 @@ def text_keys(is_manager):
 
 def check_answer(key, value, is_manager):
     """Проверяет ответ и возвращает значение для записи; None — ответ удалить. Иначе BadRequest."""
+    if not isinstance(key, str):  # список или словарь вместо ключа сломал бы поиск по множеству ключей
+        raise BadRequest("Неизвестный вопрос")
     if key in score_keys(True):
         if key not in score_keys(is_manager):
             raise BadRequest("Блок M заполняется только при оценке руководителя")

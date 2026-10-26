@@ -24,6 +24,8 @@ MAX_BODY = 1024 * 1024  # тело запроса больше 1 МБ — оши
 B24_USERS_TTL = 10 * 60  # секунд: список пользователей портала держится в памяти
 XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 BAD_REQUEST = "Неверный запрос"
+BAD_LOGIN = "Неверный логин или пароль"
+LOGIN_MAX_LEN = 40  # максимум в users.LOGIN_RE
 # единственные адреса статики: других путей нет, обойти каталог web/ нельзя
 STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -147,26 +149,39 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return c[COOKIE].value if COOKIE in c else None
 
-    def body(self):
+    def content_length(self):
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
             raise BadRequest(BAD_REQUEST)
         if n < 0:
             raise BadRequest(BAD_REQUEST)
+        return n
+
+    def drain(self, n):
+        """Читает и отбрасывает тело: непрочитанное тело оборвало бы ответ сбросом соединения.
+        Слишком большое тело (больше 4 МБ) не читаем — такое соединение пусть рвётся."""
+        self.body_consumed = True
+        left = n if n <= 4 * MAX_BODY else 0
+        while left > 0:
+            chunk = self.rfile.read(min(1 << 16, left))
+            if not chunk:
+                break
+            left -= len(chunk)
+
+    def body(self):
+        n = self.content_length()
         if n > MAX_BODY:
-            # непрочитанное тело оборвало бы ответ сбросом соединения; слишком большое просто не читаем
-            left = n if n <= 4 * MAX_BODY else 0
-            while left > 0:
-                chunk = self.rfile.read(min(1 << 16, left))
-                if not chunk:
-                    break
-                left -= len(chunk)
+            self.drain(n)
+            raise BadRequest(BAD_REQUEST)
+        # то же правило и для пустого тела: форма с другого сайта JSON-тип отправить не может,
+        # а fetch с этим типом требует предварительного запроса CORS, который сервер не разрешает
+        media_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if media_type != "application/json":
             raise BadRequest(BAD_REQUEST)
         if not n:
             return {}
-        if "application/json" not in (self.headers.get("Content-Type") or ""):
-            raise BadRequest(BAD_REQUEST)
+        self.body_consumed = True
         try:
             b = json.loads(self.rfile.read(n).decode("utf-8"))
         except ValueError:  # и UnicodeDecodeError, и JSONDecodeError
@@ -190,6 +205,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         self.cookie = None
+        self.body_consumed = False
         try:
             if path.startswith("/api/"):
                 q = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
@@ -217,6 +233,11 @@ class Handler(BaseHTTPRequestHandler):
             code, result = 500, {"error": "Ошибка сервера"}
         else:
             code = 200
+        try:
+            if not self.body_consumed:  # ответили раньше, чем разобрали тело (401, 403, 404, выход)
+                self.drain(self.content_length())
+        except (BadRequest, ConnectionError):
+            pass
         try:
             if code != 200:
                 self.send_json(result, code)
@@ -265,15 +286,18 @@ class Handler(BaseHTTPRequestHandler):
         app = self.app
         b = self.body()
         login = b.get("login")
-        login = login.strip().lower() if isinstance(login, str) else ""
-        key = (self.client_ip(), login)
+        # такой логин не существует (users.LOGIN_RE: до 40 символов): отказ сразу, без записи в LoginGuard
+        # (иначе анонимные запросы с огромными логинами копили бы память) и без хеширования
+        if not isinstance(login, str) or len(login.strip()) > LOGIN_MAX_LEN:
+            raise HttpError(401, BAD_LOGIN)
+        key = (self.client_ip(), login.strip().lower())
         with app.lock:
             if app.guard.blocked(key):
                 raise HttpError(429, "Слишком много неудачных попыток входа. Попробуйте через 15 минут")
             user = auth.check_password(app.con, b.get("login"), b.get("password"))
             if not user:
                 app.guard.failed(key)
-                raise HttpError(401, "Неверный логин или пароль")
+                raise HttpError(401, BAD_LOGIN)
             app.guard.reset(key)
             token = auth.new_session(app.con, user["id"], app.session_hours())
         self.cookie = self.cookie_header(token)
@@ -299,10 +323,7 @@ class Handler(BaseHTTPRequestHandler):
         return assessments.get_assignment(self.app.con, assignment_id, viewer=me)
 
     def h_answer(self, me, q, b, assignment_id):
-        key = b.get("key")
-        if not isinstance(key, str):  # список или словарь вместо ключа сломал бы поиск по множеству ключей
-            raise BadRequest("Неизвестный вопрос")
-        assessments.save_answer(self.app.con, assignment_id, me["id"], key, b.get("value"))
+        assessments.save_answer(self.app.con, assignment_id, me["id"], b.get("key"), b.get("value"))
         return {"ok": True}
 
     def h_submit(self, me, q, b, assignment_id):
@@ -395,6 +416,8 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True}
 
     def h_assignment_retry(self, me, q, b, assignment_id):
+        if not self.app.con.execute("SELECT 1 FROM assignments WHERE id=?", (assignment_id,)).fetchone():
+            raise NotFound("Анкета не найдена")
         b24queue.retry(self.app.con, assignment_id)
         self.wake()
         return {"ok": True}

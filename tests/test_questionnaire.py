@@ -89,6 +89,12 @@ class QuestionnaireTest(unittest.TestCase):
             check_answer("O1", 5, False)
         self.assertEqual(check_answer("extra", "да", False), "да")
 
+    def test_check_answer_key_must_be_a_string(self):
+        for key in (["A1"], {"a": 1}, 5, None, 1.5, ("A1",)):
+            with self.assertRaises(BadRequest, msg=repr(key)) as cm:
+                check_answer(key, 3, False)
+            self.assertEqual(str(cm.exception), "Неизвестный вопрос")
+
 
 if __name__ == "__main__":
     unittest.main()

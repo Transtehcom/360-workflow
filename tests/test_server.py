@@ -40,7 +40,7 @@ class Client:
     def call(self, method, path, body=None, headers=None):
         """(код, заголовки, тело в байтах)."""
         data = None if body is None else json.dumps(body).encode("utf-8")
-        h = {"Content-Type": "application/json"} if data is not None else {}
+        h = {"Content-Type": "application/json"} if method == "POST" else {}  # тип нужен на любом POST, и без тела
         h.update(headers or {})
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=h)
         try:
@@ -185,6 +185,94 @@ class AuthTest(ServerTestCase):
         code, _, _ = c.call("POST", "/api/login", {"login": "nat", "password": PASSWORD}, {"X-Forwarded-For": "10.0.0.2"})
         self.assertEqual(code, 200)
 
+    def test_login_case_variants_share_one_lockout_counter(self):
+        c = Client(self.port)
+        for i in range(10):
+            self.assertEqual(c.login("Ivanov" if i % 2 else "IVANOV", "wrong-password")[0], 401)
+        self.assertEqual(c.login("ivanov")[0], 429)
+        self.assertEqual(len(self.app.guard.fails), 1)
+
+    def test_forwarded_ip_ignored_without_trust_proxy(self):
+        self.assertFalse(self.cfg["server"].get("trust_proxy"))
+        c = Client(self.port)
+        for i in range(10):  # поддельный X-Forwarded-For не заводит отдельный счётчик
+            code, _, _ = c.call("POST", "/api/login", {"login": "nat", "password": "bad-password"},
+                                {"X-Forwarded-For": f"10.0.0.{i}"})
+            self.assertEqual(code, 401)
+        code, _, _ = c.call("POST", "/api/login", {"login": "nat", "password": PASSWORD}, {"X-Forwarded-For": "10.9.9.9"})
+        self.assertEqual(code, 429)
+        self.assertEqual(len(self.app.guard.fails), 1)
+
+    def test_oversized_and_non_string_logins_leave_no_trace(self):
+        c = Client(self.port)
+        with mock.patch("app.server.auth.check_password") as check:
+            for i in range(30):
+                code, r = c.login(f"{i}" + "x" * 100_000, "bad-password")
+                self.assertEqual((code, r), (401, {"error": "Неверный логин или пароль"}))
+            for login in ("x" * 41, " " + "x" * 41, ["nat"], {"a": 1}, 5, None):
+                self.assertEqual(c.login(login, "bad-password")[0], 401, repr(login))
+            check.assert_not_called()  # без хеширования
+        self.assertEqual(self.app.guard.fails, {})
+        # логин предельной длины (40) ещё идёт обычным путём и считается в защите от подбора
+        self.assertEqual(c.login("x" * 40, "bad-password")[0], 401)
+        self.assertEqual(list(self.app.guard.fails), [("127.0.0.1", "x" * 40)])
+
+    def test_content_type_required_on_every_post_but_logout(self):
+        c = Client(self.port)
+        code, headers, _ = c.call("POST", "/api/login", {"login": "petrov", "password": PASSWORD})
+        cookie = headers["Set-Cookie"].split(";")[0]
+        self.create_assessment(self.client("nat"))
+        gid = self.assignment_id(self.petrov)
+
+        def raw_post(path, body=b"{}", content_type=None, with_cookie=True):
+            h = {"Cookie": cookie} if with_cookie else {}
+            if content_type:
+                h["Content-Type"] = content_type
+            conn = http.client.HTTPConnection("127.0.0.1", self.port)
+            try:
+                conn.request("POST", path, body=body, headers=h)
+                resp = conn.getresponse()
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+            finally:
+                conn.close()
+
+        for ctype in (None, "text/plain", "application/x-www-form-urlencoded", "text/plain; charset=application/json",
+                      "application/jsonx", "multipart/form-data; boundary=application/json"):
+            for body in (b"{}", b""):  # и пустое тело: submit, finish, cancel и другие действия без полей
+                self.assertEqual(raw_post(f"/api/assignments/{gid}/submit", body, ctype),
+                                 (400, {"error": "Неверный запрос"}), (ctype, body))
+            self.assertEqual(raw_post("/api/login", b'{"login": "nat", "password": "secret1"}', ctype, False),
+                             (400, {"error": "Неверный запрос"}), ctype)
+        # с верным типом запрос доходит до обработчика (анкета не заполнена — это уже другая ошибка)
+        code, r = raw_post(f"/api/assignments/{gid}/submit", b"", "application/json")
+        self.assertEqual(code, 400)
+        self.assertIn("Не заполнены", r["error"])
+        self.assertEqual(raw_post(f"/api/assignments/{gid}/answer", b'{"key": "A1", "value": 3}',
+                                  "Application/JSON; charset=utf-8"), (200, {"ok": True}))
+        # выход тип не требует: он ничего не читает из тела
+        self.assertEqual(raw_post("/api/logout", b"", None), (200, {"ok": True}))
+        self.assertEqual(c.get("/api/me")[0], 401)
+
+    def test_unread_body_is_drained_before_early_responses(self):
+        big = b"x" * 900_000  # меньше предела тела, но больше буферов сокета
+        member = Client(self.port)
+        _, headers, _ = member.call("POST", "/api/login", {"login": "petrov", "password": PASSWORD})
+        session = headers["Set-Cookie"].split(";")[0]
+        for path, cookie, expected in (("/api/admin/users", "", 401), ("/api/nothing", "", 401),
+                                       ("/api/admin/users", session, 403), ("/api/nothing", session, 404),
+                                       ("/api/logout", session, 200)):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port)
+            try:
+                h = {"Content-Type": "application/json"}
+                if cookie:
+                    h["Cookie"] = cookie
+                conn.request("POST", path, body=big, headers=h)
+                resp = conn.getresponse()  # ответ дочитывается, а не обрывается сбросом соединения
+                resp.read()
+                self.assertEqual(resp.status, expected, path)
+            finally:
+                conn.close()
+
 
 class SecureCookieTest(ServerTestCase):
     cfg_patch = {"secure_cookie": True}
@@ -301,6 +389,7 @@ class FlowTest(ServerTestCase):
         petrov_gid = self.assignment_id(self.petrov)
         self.assertEqual(admin.post(f"/api/admin/assignments/{petrov_gid}/return")[0], 409)  # ещё не отправлена
         self.assertEqual(admin.post(f"/api/admin/assignments/{petrov_gid}/retry")[0], 200)
+        self.assertEqual(admin.post("/api/admin/assignments/99999/retry")[0], 404)
         self.assertEqual(admin.post(f"/api/admin/assessments/{aid}/finish")[0], 200)
         self.assertEqual(admin.post(f"/api/admin/assessments/{aid}/cancel")[0], 409)
         self.assertEqual(self.client("petrov").get("/api/my"), (200, []))
@@ -437,6 +526,15 @@ class B24UsersTest(ServerTestCase):
 
 
 class StaticTest(ServerTestCase):
+    def test_real_interface_assets(self):
+        c = Client(self.port)
+        for path, content_type in (("/", "text/html"), ("/app.js", "application/javascript"),
+                                   ("/style.css", "text/css")):
+            code, headers, data = c.call("GET", path)
+            self.assertEqual(code, 200, path)
+            self.assertTrue(headers["Content-Type"].startswith(content_type), path)
+            self.assertGreater(len(data), 100, path)
+
     def test_static(self):
         with tempfile.TemporaryDirectory() as web:
             with open(os.path.join(web, "index.html"), "w", encoding="utf-8") as f:

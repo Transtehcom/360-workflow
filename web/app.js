@@ -11,8 +11,11 @@ class DraftSaver {
     this.running = null;
     this.timer = null;
     this.error = null;
+    this.closed = null;
   }
   change(key, value, immediate = false) {
+    // Анкета закрыта для изменений: запись всё равно не будет принята, очередь не копим.
+    if (this.closed) return;
     this.dirty.set(key, { value, version: ++this.version });
     this.error = null;
     clearTimeout(this.timer);
@@ -20,11 +23,12 @@ class DraftSaver {
     if (immediate) this.flush();
     else this.timer = setTimeout(() => this.flush(), this.delay);
   }
+  // true — ждать больше нечего (всё сохранено или анкета закрыта); false — остались несохранённые записи.
   async flush() {
     clearTimeout(this.timer);
     this.timer = null;
     if (this.running) return this.running;
-    if (!this.dirty.size) return true;
+    if (this.closed || !this.dirty.size) return true;
     this.error = null;
     // Запуск в микрозадаче, чтобы running был установлен до уведомления интерфейса.
     this.running = Promise.resolve().then(async () => {
@@ -38,6 +42,13 @@ class DraftSaver {
         }
         return true;
       } catch (error) {
+        // 404/409: анкету убрали или закрыли. Повтор бессмыслен, поэтому ждать больше нечего.
+        if (error.status === 404 || error.status === 409) {
+          this.closed = error;
+          this.error = null;
+          this.dirty.clear();
+          return true;
+        }
         this.error = error;
         return false;
       } finally {
@@ -66,6 +77,7 @@ if (typeof document !== "undefined") (() => {
   const answerStatus = { draft: "Не отправлена", submitted: "Отправлена", closed: "Закрыта" };
   const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const date = value => value ? value.slice(0, 10).split("-").reverse().join(".") : "—";
+  const closedNotice = "Анкета закрыта для изменений — ответ не сохранён";
   const errorBox = () => '<div class="error" role="alert"></div>';
   const tag = (status, labels) => `<span class="tag ${esc(status)}">${esc(labels[status] || status)}</span>`;
   const userOptions = (users, selected = "") => '<option value="">Выберите участника</option>' + users.filter(u => u.active).map(u => `<option value="${u.id}" ${Number(selected) === u.id ? "selected" : ""}>${esc(u.fio)}${u.position ? " · " + esc(u.position) : ""}</option>`).join("");
@@ -89,10 +101,11 @@ if (typeof document !== "undefined") (() => {
       });
       if (response.status === 401 && path !== "/api/login") loginRequired();
       if (attachment && response.ok) return { blob: await response.blob(), header: response.headers.get("Content-Disposition") };
-      const data = await response.json();
-      if (!response.ok) {
-        const error = new Error(data.error || "Не удалось выполнить запрос");
-        error.status = response.status;
+      // Ответ прокси или шлюза может быть не JSON (например, HTML-страница 502).
+      const data = await response.json().catch(() => null);
+      if (!response.ok || data === null) {
+        const error = new Error(data?.error || `Не удалось выполнить запрос (HTTP ${response.status})`);
+        if (!response.ok) error.status = response.status;
         throw error;
       }
       return data;
@@ -265,11 +278,13 @@ if (typeof document !== "undefined") (() => {
     if (!draft || !root.querySelector("#questionnaire") || Number(root.querySelector("#questionnaire").dataset.id) !== draft.id) return;
     const saver = draft.saver;
     const status = root.querySelector("#save-status");
-    status.textContent = saver.error ? "Не сохранено: " + saver.error.message : saver.pending ? "Сохраняю…" : draft.editable ? "Сохранено" : "Только просмотр";
-    status.className = "save-status " + (saver.error ? "error" : saver.pending ? "muted" : "success");
+    status.textContent = saver.closed ? closedNotice : saver.error ? "Не сохранено, повторите" : saver.pending ? "Сохраняю…" : draft.editable ? "Сохранено" : "Только просмотр";
+    status.title = saver.error ? saver.error.message : "";
+    status.className = "save-status " + (saver.closed || saver.error ? "error" : saver.pending ? "muted" : "success");
+    if (saver.closed) root.querySelectorAll("[data-text], [data-score]").forEach(input => input.disabled = true);
     root.querySelector("#retry-save").hidden = !saver.error || !draft.editable;
     const submit = root.querySelector("#submit-answers");
-    if (submit) submit.disabled = saver.pending || draft.submitting;
+    if (submit) submit.disabled = saver.pending || draft.submitting || Boolean(saver.closed);
     const count = draft.schema.blocks.filter(complete).length;
     root.querySelector("#progress-text").textContent = `Заполнено ${count} из ${draft.schema.blocks.length} блоков`;
     root.querySelectorAll("[data-block]").forEach(button => button.classList.toggle("done", Number(button.dataset.block) < draft.schema.blocks.length && complete(draft.schema.blocks[Number(button.dataset.block)])));
@@ -309,6 +324,7 @@ if (typeof document !== "undefined") (() => {
       if (d.submitting) return;
       d.submitting = true; updateDraftStatus();
       if (!(await d.saver.flush())) { d.submitting = false; updateDraftStatus(); return; }
+      if (d.saver.closed) { d.submitting = false; updateDraftStatus(); showError(root.querySelector("#questionnaire"), new Error(closedNotice)); return; }
       const missing = blocks.findIndex(b => !complete(b));
       if (missing >= 0) { d.submitting = false; changeView(missing); showError(root.querySelector("#questionnaire"), new Error("Ответьте на все утверждения в этом блоке перед отправкой.")); return; }
       // После отправки позднее изменение из того же экрана не должно попадать в очередь.
@@ -319,7 +335,15 @@ if (typeof document !== "undefined") (() => {
         location.hash = me?.is_admin ? "#admin" : "#my";
       } catch (error) {
         d.submitting = false;
-        if (me) { renderQuestionnaire(back); showError(root.querySelector("#questionnaire"), error); }
+        if (!me) return;
+        if (error.status === 400) {
+          // Сервер называет незаполненные блоки; если текст иной — берём первый неполный по своим данным.
+          const keys = (error.message.split(":")[1] || "").split(",").map(key => key.trim());
+          let index = blocks.findIndex(b => keys.includes(b.key));
+          if (index < 0) index = blocks.findIndex(b => !complete(b));
+          if (index >= 0) { changeView(index); showError(root.querySelector("#questionnaire"), error); return; }
+        }
+        renderQuestionnaire(back); showError(root.querySelector("#questionnaire"), error);
       }
     });
     updateDraftStatus();
@@ -329,7 +353,9 @@ if (typeof document !== "undefined") (() => {
     const current = ++generation;
     const hash = location.hash || (me?.is_admin ? "#admin" : "#my");
     // При переходе из анкеты дождаться текстовых ответов. При 401 вход доступен сразу.
-    if (me && draft?.saver.pending && hash !== renderedHash && hash !== "#login") {
+    // Возврат на собственную анкету (например, после повторного входа) ничего не теряет и не блокируется.
+    const ownDraft = Boolean(draft) && hash.match(/^#a\/(\d+)/)?.[1] === String(draft.id);
+    if (me && draft?.saver.pending && hash !== renderedHash && hash !== "#login" && !ownDraft) {
       if (!(await draft.saver.flush())) {
         if (me) { history.replaceState(null, "", renderedHash); showError(root, new Error("Есть несохранённые ответы. Повторите сохранение перед переходом.")); }
         return;

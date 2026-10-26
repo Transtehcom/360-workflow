@@ -82,10 +82,10 @@ td .actions { gap: 6px; }
 .back { display: inline-block; margin-bottom: 18px; }
 .open-question + .open-question { margin-top: 22px; }
 @media (max-width: 700px) {
-  .header-inner { padding: 14px 16px; }
-  .brand > span:last-child { display: none; }
-  #account { gap: 8px; max-width: calc(100% - 96px); }
-  #account span { overflow-wrap: anywhere; }
+  .header-inner { padding: 14px 16px; gap: 12px; }
+  .brand-mark { font-size: 16px; padding: 6px 10px; white-space: nowrap; }
+  #account { gap: 8px; flex: 1; min-width: 0; justify-content: flex-end; }
+  #account span { overflow-wrap: anywhere; font-size: 13px; text-align: right; }
   .navigation { padding: 0 16px; gap: 22px; }
   main { padding: 24px 16px 50px; }
   .panel { padding: 20px; }

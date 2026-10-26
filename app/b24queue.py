@@ -39,7 +39,7 @@ def task_status(con, assignment_id):
     a = con.execute("SELECT a.b24_task_id, u.b24_user_id FROM assignments a JOIN users u ON u.id = a.user_id "
                     "WHERE a.id=?", (assignment_id,)).fetchone()
     if not a or a["b24_user_id"] is None:
-        return "нет связи с Битрикс24"
+        return "не связан с Битрикс24"
     pending = con.execute("SELECT attempts, last_error FROM b24_ops WHERE assignment_id=? AND done_at IS NULL "
                           "ORDER BY id", (assignment_id,)).fetchall()
     if any(p["attempts"] >= MAX_ATTEMPTS for p in pending):

@@ -73,7 +73,7 @@ class AssessmentsTest(unittest.TestCase):
 
     def test_create_enqueues_tasks_only_for_linked(self):
         self.assertEqual(self.ops(), [(self.a_self, "create", {}), (self.a_peer, "create", {})])
-        self.assertEqual(b24queue.task_status(self.con, self.a_client), "нет связи с Битрикс24")
+        self.assertEqual(b24queue.task_status(self.con, self.a_client), "не связан с Битрикс24")
         self.assertEqual(b24queue.task_status(self.con, self.a_peer), "ставится…")
         a = asm.get_assessment(self.con, self.aid)
         self.assertEqual([r["role"] for r in a["respondents"]], ["self", "peer", "client"])

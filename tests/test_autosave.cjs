@@ -64,3 +64,32 @@ test('сбой в середине очереди не повторяет уже
   assert.equal(await saver.flush(), true);
   assert.deepEqual(calls, [['A1', 3], ['A2', 4], ['extra', 'Спасибо']]);
 });
+
+for (const status of [409, 404]) {
+  test(`постоянная ошибка ${status} не оставляет очередь в ожидании и не блокирует переход`, async () => {
+    const calls = [];
+    const saver = new DraftSaver(async (key, value) => {
+      calls.push([key, value]);
+      const error = new Error('Анкета закрыта'); error.status = status; throw error;
+    }, () => {});
+    saver.change('A1', 3); saver.change('A2', 4);
+    assert.equal(await saver.flush(), true);
+    assert.equal(saver.pending, false);
+    assert.equal(saver.error, null);
+    assert.equal(saver.closed.status, status);
+    assert.deepEqual(calls, [['A1', 3]]);
+    // Очередь остановлена: новые изменения не уходят на сервер и не создают ожидание.
+    saver.change('A3', 5, true);
+    assert.equal(await saver.flush(), true);
+    assert.equal(saver.pending, false);
+    assert.deepEqual(calls, [['A1', 3]]);
+  });
+}
+
+test('временная ошибка 500 по-прежнему оставляет запись для повтора', async () => {
+  const saver = new DraftSaver(async () => { const error = new Error('Сбой'); error.status = 500; throw error; }, () => {});
+  saver.change('A1', 3);
+  assert.equal(await saver.flush(), false);
+  assert.equal(saver.pending, true);
+  assert.equal(saver.closed, null);
+});

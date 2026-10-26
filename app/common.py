@@ -12,7 +12,7 @@ DATA_DIR = os.path.join(ROOT, "data")
 DB_PATH = os.path.join(DATA_DIR, "360.sqlite")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 BACKUP_KEEP_DAYS = 14
-_BACKUP_NAME = re.compile(r"^360-(\d{4}-\d{2}-\d{2})\.sqlite$")
+_BACKUP_NAME = re.compile(r"^360-(\d{4}-\d{2}-\d{2})\.sqlite(\.tmp)?$")
 
 _db_lock = threading.RLock()
 
@@ -90,8 +90,8 @@ def db_lock():
 
 def backup_db(con, folder=BACKUP_DIR, day=None):
     """Копия базы за день: folder/360-ГГГГ-ММ-ДД.sqlite через SQLite backup API, под общей блокировкой.
-    Если копия за этот день уже есть, новая не снимается. Копии старше BACKUP_KEEP_DAYS дней удаляются.
-    Возвращает путь новой копии или None."""
+    Если копия за этот день уже есть, новая не снимается. Копии старше BACKUP_KEEP_DAYS дней удаляются,
+    как и временные файлы оборванных копий за прошлые дни. Возвращает путь новой копии или None."""
     day = day or today()
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, f"360-{day.isoformat()}.sqlite")
@@ -113,7 +113,8 @@ def backup_db(con, folder=BACKUP_DIR, day=None):
     for name in os.listdir(folder):
         m = _BACKUP_NAME.match(name)
         try:
-            old = m is not None and dt.date.fromisoformat(m.group(1)) < oldest
+            # временный файл прошлого дня — копия, оборванная выключением или сбоем: её уже не закончат
+            old = m is not None and dt.date.fromisoformat(m.group(1)) < (day if m.group(2) else oldest)
         except ValueError:  # имя похоже, но это не дата — файл не наш
             old = False
         if old:

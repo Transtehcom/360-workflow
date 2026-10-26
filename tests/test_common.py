@@ -44,6 +44,21 @@ class CommonTest(unittest.TestCase):
                                                           "360-2026-99-99.sqlite", "notes.txt"])
         con.close()
 
+    def test_backup_removes_stale_temporary_copies(self):
+        # копию оборвали (выключили компьютер) — её временный файл не должен копиться годами
+        con = connect(":memory:")
+        day = dt.date(2026, 10, 26)
+        with tempfile.TemporaryDirectory() as folder:
+            backup_db(con, folder, day)
+            for name in ("360-2026-10-25.sqlite.tmp", "360-2026-09-01.sqlite.tmp", "360-2026-10-26.sqlite.tmp",
+                         "360-2026-10-27.sqlite.tmp", "other.sqlite.tmp"):
+                open(os.path.join(folder, name), "w").close()
+            self.assertIsNone(backup_db(con, folder, day))
+            # сегодняшний и завтрашний временные файлы могут быть чужой копией в работе; чужие имена не трогаем
+            self.assertEqual(sorted(os.listdir(folder)), ["360-2026-10-26.sqlite", "360-2026-10-26.sqlite.tmp",
+                                                          "360-2026-10-27.sqlite.tmp", "other.sqlite.tmp"])
+        con.close()
+
     def test_example_config_has_defaults(self):
         with open(os.path.join(ROOT, "config.example.json"), encoding="utf-8") as f:
             cfg = json.load(f)

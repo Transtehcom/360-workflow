@@ -15,7 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import server, users  # noqa: E402
+from app import auth, server, users  # noqa: E402
 from app.bitrix24 import B24Error  # noqa: E402
 from app.common import ROOT, connect, today  # noqa: E402
 from app.questionnaire import score_keys  # noqa: E402
@@ -203,9 +203,52 @@ class AuthTest(ServerTestCase):
         self.assertEqual(code, 429)
         self.assertEqual(len(self.app.guard.fails), 1)
 
+    def lock_is_free(self):
+        """Свободна ли общая блокировка для другого потока (RLock своего потока взялся бы всегда)."""
+        result = []
+
+        def probe():
+            result.append(self.app.lock.acquire(timeout=2))
+            if result[0]:
+                self.app.lock.release()
+
+        t = threading.Thread(target=probe)
+        t.start()
+        t.join()
+        return result[0]
+
+    def test_password_hash_is_outside_the_lock(self):
+        free, real = [], auth.hash_password
+
+        def probe(password, salt=None):
+            free.append(self.lock_is_free())
+            return real(password, salt)
+
+        c = Client(self.port)
+        with mock.patch("app.auth.hash_password", side_effect=probe):
+            self.assertEqual(c.login("nat")[0], 200)
+            self.assertEqual(c.login("nat", "wrong-password")[0], 401)
+            self.assertEqual(c.login("nobody", "wrong-password")[0], 401)
+        # и для несуществующего логина хеш считается — с фиктивной солью: время ответа то же
+        self.assertEqual(free, [True, True, True])
+
+    def test_password_changed_while_hashing_is_rejected(self):
+        changed, real = [], auth.hash_password
+
+        def probe(password, salt=None):
+            result = real(password, salt)
+            if not changed:  # пароль сменили, пока считался хеш попытки входа
+                changed.append(1)
+                users.update_user(self.con, self.petrov, password="другой-пароль")
+            return result
+
+        with mock.patch("app.auth.hash_password", side_effect=probe):
+            self.assertEqual(Client(self.port).login("petrov")[0], 401)
+        self.assertEqual(Client(self.port).login("petrov", "другой-пароль")[0], 200)
+
     def test_oversized_and_non_string_logins_leave_no_trace(self):
         c = Client(self.port)
-        with mock.patch("app.server.auth.check_password") as check:
+        with mock.patch("app.auth.hash_password") as check:
             for i in range(30):
                 code, r = c.login(f"{i}" + "x" * 100_000, "bad-password")
                 self.assertEqual((code, r), (401, {"error": "Неверный логин или пароль"}))
@@ -217,7 +260,7 @@ class AuthTest(ServerTestCase):
         self.assertEqual(c.login("x" * 40, "bad-password")[0], 401)
         self.assertEqual(list(self.app.guard.fails), [("127.0.0.1", "x" * 40)])
 
-    def test_content_type_required_on_every_post_but_logout(self):
+    def test_content_type_required_on_every_post(self):
         c = Client(self.port)
         code, headers, _ = c.call("POST", "/api/login", {"login": "petrov", "password": PASSWORD})
         cookie = headers["Set-Cookie"].split(";")[0]
@@ -249,8 +292,11 @@ class AuthTest(ServerTestCase):
         self.assertIn("Не заполнены", r["error"])
         self.assertEqual(raw_post(f"/api/assignments/{gid}/answer", b'{"key": "A1", "value": 3}',
                                   "Application/JSON; charset=utf-8"), (200, {"ok": True}))
-        # выход тип не требует: он ничего не читает из тела
-        self.assertEqual(raw_post("/api/logout", b"", None), (200, {"ok": True}))
+        # и выход: иначе форма с другого сайта разлогинила бы участника
+        for ctype in (None, "text/plain", "application/x-www-form-urlencoded"):
+            self.assertEqual(raw_post("/api/logout", b"", ctype), (400, {"error": "Неверный запрос"}), ctype)
+        self.assertEqual(c.get("/api/me")[0], 200)  # сессия цела
+        self.assertEqual(raw_post("/api/logout", b"", "application/json"), (200, {"ok": True}))  # тело может быть пустым
         self.assertEqual(c.get("/api/me")[0], 401)
 
     def test_unread_body_is_drained_before_early_responses(self):
@@ -394,6 +440,16 @@ class FlowTest(ServerTestCase):
         self.assertEqual(admin.post(f"/api/admin/assessments/{aid}/cancel")[0], 409)
         self.assertEqual(self.client("petrov").get("/api/my"), (200, []))
 
+    def test_password_change_ends_sessions(self):
+        admin, petrov = self.client("nat"), self.client("petrov")
+        self.assertEqual(admin.post(f"/api/admin/users/{self.petrov}", {"password": "новый-пароль"})[0], 200)
+        self.assertEqual(petrov.get("/api/me")[0], 401)
+        self.assertEqual(admin.get("/api/me")[0], 200)
+        # свой пароль: закрываются все сессии, включая текущую, — интерфейс покажет вход
+        self.assertEqual(admin.post(f"/api/admin/users/{self.nat}", {"password": "новый-пароль"})[0], 200)
+        self.assertEqual(admin.get("/api/me")[0], 401)
+        self.assertEqual(admin.login("nat", "новый-пароль")[0], 200)
+
     def test_return_for_revision(self):
         admin = self.client("nat")
         self.create_assessment(admin)
@@ -533,6 +589,8 @@ class StaticTest(ServerTestCase):
             code, headers, data = c.call("GET", path)
             self.assertEqual(code, 200, path)
             self.assertTrue(headers["Content-Type"].startswith(content_type), path)
+            # после обновления приложения браузер не должен брать старый файл из кеша
+            self.assertEqual(headers["Cache-Control"], "no-cache", path)
             self.assertGreater(len(data), 100, path)
 
     def test_static(self):

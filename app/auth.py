@@ -51,15 +51,32 @@ class LoginGuard:
         self.fails.pop(key, None)
 
 
+_DUMMY_SALT = secrets.token_hex(16)  # соль для попытки входа под несуществующим логином
+
+
+def login_row(con, login):
+    """Активный пользователь по логину (без учёта регистра) или None."""
+    if not isinstance(login, str):
+        return None
+    return con.execute("SELECT * FROM users WHERE login=? AND active=1", (login.strip().lower(),)).fetchone()
+
+
+def attempt_hash(row, password):
+    """Хеш введённого пароля с солью пользователя. Логина нет — с фиктивной солью: ответ занимает то же
+    время, и по нему не узнать, есть ли такой логин. Это долгий PBKDF2: вызывать вне блокировки базы."""
+    return hash_password(password if isinstance(password, str) else "", row["salt"] if row else _DUMMY_SALT)[0]
+
+
+def hash_matches(row, h):
+    return row is not None and hmac.compare_digest(h, row["pwd_hash"])
+
+
 def check_password(con, login, password):
     """Пользователь, если пароль верен и учётная запись активна; иначе None. Логин — без учёта регистра."""
-    if not isinstance(login, str) or not isinstance(password, str):
+    if not isinstance(password, str):
         return None
-    r = con.execute("SELECT * FROM users WHERE login=? AND active=1", (login.strip().lower(),)).fetchone()
-    if not r:
-        return None
-    h, _ = hash_password(password, r["salt"])
-    return r if hmac.compare_digest(h, r["pwd_hash"]) else None
+    r = login_row(con, login)
+    return r if hash_matches(r, attempt_hash(r, password)) else None
 
 
 def new_session(con, user_id, hours):

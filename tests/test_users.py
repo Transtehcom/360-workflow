@@ -78,6 +78,16 @@ class UsersTest(unittest.TestCase):
         self.assertIsNone(auth.check_password(self.con, "ivanov", "secret1"))
         self.assertIsNotNone(auth.check_password(self.con, "ivanov", "newpass"))
 
+    def test_password_reset_ends_sessions_of_that_user(self):
+        uid, other = self.make(), self.make("petrov", fio="Петров")
+        tokens = [auth.new_session(self.con, uid, 12), auth.new_session(self.con, uid, 12)]
+        kept = auth.new_session(self.con, other, 12)
+        users.update_user(self.con, uid, fio="Иванов И.")  # правка без пароля сессии не трогает
+        self.assertIsNotNone(auth.session_user(self.con, tokens[0]))
+        users.update_user(self.con, uid, password="newpass")
+        self.assertEqual([auth.session_user(self.con, t) for t in tokens], [None, None])
+        self.assertEqual(auth.session_user(self.con, kept)["id"], other)
+
     def test_empty_password_in_update_means_no_change(self):
         uid = self.make()
         users.update_user(self.con, uid, password="", fio="Иванов И.")

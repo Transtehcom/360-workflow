@@ -118,6 +118,10 @@ def update_user(con, user_id, **fields):
         try:
             con.execute(f"UPDATE users SET {', '.join(k + '=?' for k in sets)} WHERE id=?",
                         (*sets.values(), user_id))
+            if "pwd_hash" in sets:
+                # новый пароль закрывает все сессии участника, в том числе текущую, если администратор
+                # сменил пароль себе: войти придётся заново
+                con.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
             con.commit()
         except sqlite3.IntegrityError:
             con.rollback()

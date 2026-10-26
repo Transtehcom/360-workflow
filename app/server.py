@@ -117,8 +117,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("X-Content-Type-Options", "nosniff")
-        if path.endswith(".html"):  # после обновления приложения браузер не должен показывать старую страницу
-            self.send_header("Cache-Control", "no-cache")
+        # после обновления приложения браузер не должен брать из кеша старую страницу, скрипт или стили
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -169,16 +169,19 @@ class Handler(BaseHTTPRequestHandler):
                 break
             left -= len(chunk)
 
+    def require_json(self):
+        """Тип application/json — на любом POST, и с пустым телом: форма с другого сайта JSON-тип отправить
+        не может, а fetch с этим типом требует предварительного запроса CORS, который сервер не разрешает."""
+        media_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if media_type != "application/json":
+            raise BadRequest(BAD_REQUEST)
+
     def body(self):
         n = self.content_length()
         if n > MAX_BODY:
             self.drain(n)
             raise BadRequest(BAD_REQUEST)
-        # то же правило и для пустого тела: форма с другого сайта JSON-тип отправить не может,
-        # а fetch с этим типом требует предварительного запроса CORS, который сервер не разрешает
-        media_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if media_type != "application/json":
-            raise BadRequest(BAD_REQUEST)
+        self.require_json()
         if not n:
             return {}
         self.body_consumed = True
@@ -256,6 +259,7 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/login":
             return self.login()
         if method == "POST" and path == "/api/logout":
+            self.require_json()  # тело выходу не нужно (дочитывается в handle_request), но тип — обязателен
             if self.token():
                 auth.drop_session(app.con, self.token())
             self.cookie = self.cookie_header("", expire=True)
@@ -291,11 +295,18 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(login, str) or len(login.strip()) > LOGIN_MAX_LEN:
             raise HttpError(401, BAD_LOGIN)
         key = (self.client_ip(), login.strip().lower())
+        password = b.get("password")
         with app.lock:
             if app.guard.blocked(key):
                 raise HttpError(429, "Слишком много неудачных попыток входа. Попробуйте через 15 минут")
-            user = auth.check_password(app.con, b.get("login"), b.get("password"))
-            if not user:
+            row = auth.login_row(app.con, login)
+        # PBKDF2 — вне общей блокировки: иначе каждая попытка входа на доли секунды останавливала бы все запросы
+        h = auth.attempt_hash(row, password)
+        with app.lock:
+            # пока считался хеш, пароль могли сменить, а учётную запись — отключить: сверяем с текущей строкой
+            user = auth.login_row(app.con, login)
+            if (not isinstance(password, str) or row is None or user is None or user["salt"] != row["salt"]
+                    or not auth.hash_matches(user, h)):
                 app.guard.failed(key)
                 raise HttpError(401, BAD_LOGIN)
             app.guard.reset(key)

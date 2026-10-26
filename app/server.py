@@ -14,7 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import assessments, auth, b24queue, users
 from .b24queue import Worker
 from .bitrix24 import B24Error, B24Tasks, Bitrix24
-from .common import ROOT, BadRequest, Conflict, Forbidden, NotFound, connect, db_lock, load_config, today
+from .common import (ROOT, BadRequest, Conflict, Forbidden, NotFound, backup_db, connect, db_lock, load_config,
+                     today)
 from .questionnaire import EXTRA_TITLE, INSTRUCTION, OPEN_QUESTIONS, ROLES, SCALE, blocks_for
 from .report import build_report
 
@@ -26,6 +27,8 @@ XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 BAD_REQUEST = "Неверный запрос"
 BAD_LOGIN = "Неверный логин или пароль"
 LOGIN_MAX_LEN = 40  # максимум в users.LOGIN_RE
+BACKUP_FIRST_DELAY = 60  # секунд после запуска до первой копии базы
+BACKUP_CHECK_PERIOD = 3600  # секунд: раз в столько проверяется, есть ли копия за сегодня
 # единственные адреса статики: других путей нет, обойти каталог web/ нельзя
 STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -439,6 +442,21 @@ def make_server(app, host, port):
     return ThreadingHTTPServer((host, port), handler)
 
 
+def backup_daily(con):
+    """Фоновый поток: копия базы раз в день (data/backups), независимо от Битрикс24. Первая — вскоре после
+    запуска, если за сегодня копии ещё нет; дальше проверка раз в час. Сбой пишется в журнал и не
+    останавливает приложение."""
+    time.sleep(BACKUP_FIRST_DELAY)
+    while True:
+        try:
+            made = backup_db(con)
+            if made:
+                print(f"Копия базы: {made}")
+        except Exception:
+            traceback.print_exc()
+        time.sleep(BACKUP_CHECK_PERIOD)
+
+
 def serve():
     config = load_config()
     app = App(config, connect())
@@ -456,6 +474,7 @@ def serve():
         print("Битрикс24: задачи и напоминания включены")
     else:
         print("Битрикс24: адрес вебхука не задан в config.json — задачи не создаются")
+    threading.Thread(target=backup_daily, args=(app.con,), name="db-backup", daemon=True).start()
     url = f"http://localhost:{port}"
     print(f"Оценка 360° работает: {url}  (Ctrl+C или закрытие окна — остановить)")
     if srv.get("open_browser", True):

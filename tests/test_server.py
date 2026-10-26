@@ -1,3 +1,4 @@
+import contextlib
 import datetime as dt
 import http.client
 import http.cookiejar
@@ -579,6 +580,21 @@ class B24UsersTest(ServerTestCase):
         app.tasks = Probe()
         self.assertEqual(self.client("nat").get("/api/admin/b24-users")[0], 200)
         self.assertEqual(held, [True])
+
+
+class BackupThreadTest(unittest.TestCase):
+    def test_backup_error_is_logged_and_not_fatal(self):
+        class Stop(Exception):
+            pass
+        sleeps = [None, None, Stop()]  # пауза после запуска, после первой и после второй попытки
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("app.server.time.sleep", side_effect=sleeps), \
+                mock.patch("app.server.backup_db", side_effect=[OSError("нет места"), "data/backups/360.sqlite"]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(Stop):
+                server.backup_daily(None)
+        self.assertIn("OSError: нет места", err.getvalue())
+        self.assertIn("Копия базы: data/backups/360.sqlite", out.getvalue())
 
 
 class StaticTest(ServerTestCase):

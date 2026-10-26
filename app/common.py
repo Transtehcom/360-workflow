@@ -1,7 +1,8 @@
-"""Общие функции: настройки, база SQLite, даты, ошибки домена."""
+"""Общие функции: настройки, база SQLite и её копии, даты, ошибки домена."""
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -9,6 +10,9 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data")
 DB_PATH = os.path.join(DATA_DIR, "360.sqlite")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+BACKUP_KEEP_DAYS = 14
+_BACKUP_NAME = re.compile(r"^360-(\d{4}-\d{2}-\d{2})\.sqlite$")
 
 _db_lock = threading.RLock()
 
@@ -82,6 +86,39 @@ def connect(path=None):
 
 def db_lock():
     return _db_lock
+
+
+def backup_db(con, folder=BACKUP_DIR, day=None):
+    """Копия базы за день: folder/360-ГГГГ-ММ-ДД.sqlite через SQLite backup API, под общей блокировкой.
+    Если копия за этот день уже есть, новая не снимается. Копии старше BACKUP_KEEP_DAYS дней удаляются.
+    Возвращает путь новой копии или None."""
+    day = day or today()
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"360-{day.isoformat()}.sqlite")
+    made = None
+    if not os.path.exists(path):
+        # сначала во временный файл: оборванная копия не займёт место дневной
+        tmp = path + ".tmp"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        dest = sqlite3.connect(tmp)
+        try:
+            with db_lock():
+                con.backup(dest)
+        finally:
+            dest.close()
+        os.replace(tmp, path)
+        made = path
+    oldest = day - dt.timedelta(days=BACKUP_KEEP_DAYS)
+    for name in os.listdir(folder):
+        m = _BACKUP_NAME.match(name)
+        try:
+            old = m is not None and dt.date.fromisoformat(m.group(1)) < oldest
+        except ValueError:  # имя похоже, но это не дата — файл не наш
+            old = False
+        if old:
+            os.remove(os.path.join(folder, name))
+    return made
 
 
 def now():

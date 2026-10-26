@@ -61,8 +61,14 @@ class DraftSaver {
   get pending() { return Boolean(this.running || this.dirty.size); }
 }
 
+// Пароль, который администратор видит, диктует и переписывает: без похожих 0/O/o и 1/l/I.
+const PASSWORD_ALPHABET = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function generatePassword(length = 10, random = n => crypto.getRandomValues(new Uint32Array(n))) {
+  return Array.from(random(length), value => PASSWORD_ALPHABET[value % PASSWORD_ALPHABET.length]).join("");
+}
+
 // Проверка очереди средствами Node не требует браузера и внешних библиотек.
-if (typeof module !== "undefined" && module.exports) module.exports = { DraftSaver };
+if (typeof module !== "undefined" && module.exports) module.exports = { DraftSaver, generatePassword, PASSWORD_ALPHABET };
 
 if (typeof document !== "undefined") (() => {
   const root = document.querySelector("#app");
@@ -166,7 +172,7 @@ if (typeof document !== "undefined") (() => {
   function bindDownloads() { root.querySelectorAll("[data-download]").forEach(button => button.addEventListener("click", () => download(button.dataset.download, button))); }
 
   function renderLogin() {
-    root.innerHTML = `<section class="panel login"><p class="eyebrow">Оценка 360°</p><h1>Добро пожаловать</h1><p class="muted">Войдите под логином и паролем, которые вам выдал администратор.</p><form class="stack" id="login-form"><label>Логин<input name="login" autocomplete="username" required autofocus></label><label>Пароль<input name="password" type="password" autocomplete="current-password" required></label>${errorBox()}<button type="submit" class="primary">Войти</button></form></section>`;
+    root.innerHTML = `<section class="panel login"><p class="eyebrow">Оценка 360°</p><h1>Добро пожаловать</h1><p class="muted">Войдите под логином и паролем, которые вам выдал администратор.</p><form class="stack" id="login-form"><label>Логин<input name="login" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required autofocus></label><label>Пароль<input name="password" type="password" autocomplete="current-password" required></label>${errorBox()}<button type="submit" class="primary">Войти</button></form></section>`;
     formAction(root.querySelector("form"), async data => {
       await request("/api/login", { login: data.get("login"), password: data.get("password") });
       me = await request("/api/me");
@@ -240,7 +246,7 @@ if (typeof document !== "undefined") (() => {
     root.innerHTML = `<div class="intro"><p class="eyebrow">Администратор</p><h1>Участники</h1><p class="muted">Заведите учётные записи и передайте участникам логины и пароли.</p></div><section class="panel"><div class="between"><h2>Все участники <span class="tag">${users.length}</span></h2><button id="new-user">+ Новый участник</button></div><div class="table-wrap"><table><thead><tr><th>ФИО / должность</th><th>Логин</th><th>Битрикс24</th><th>Доступ</th><th></th></tr></thead><tbody>${users.map(u => `<tr><td><strong>${esc(u.fio)}</strong><div class="muted">${esc(u.position)}</div></td><td data-label="Логин">${esc(u.login)}</td><td data-label="Битрикс24">${u.b24_user_id ? esc(b24.find(b => b.id === u.b24_user_id)?.name || "№" + u.b24_user_id) : "Не связан"}</td><td>${u.is_admin ? "Администратор" : "Участник"}${!u.active ? ' · <span class="error">Отключён</span>' : ""}</td><td><button class="small" data-edit="${u.id}">Изменить</button></td></tr>`).join("")}</tbody></table></div></section><section class="panel" id="user-panel"></section>`;
     function edit(user = {}) {
       const linked = b24.find(b => b.id === user.b24_user_id);
-      root.querySelector("#user-panel").innerHTML = `<h2>${user.id ? "Изменить участника" : "Новый участник"}</h2><form id="user-form" class="stack"><div class="form-grid"><label>ФИО<input name="fio" required value="${esc(user.fio)}"></label><label>Должность<input name="position" value="${esc(user.position)}"></label><label>Логин<input name="login" required pattern="[A-Za-z0-9._-]{2,40}" maxlength="40" autocomplete="off" value="${esc(user.login)}"><span class="muted">Латиница, цифры, точка, дефис, подчёркивание.</span></label><label>${user.id ? "Новый пароль" : "Пароль"}<input name="password" type="password" minlength="6" autocomplete="new-password" ${user.id ? 'placeholder="Оставьте пустым, чтобы сохранить текущий"' : "required"}><span class="muted">Не менее 6 символов.</span></label><label class="full">Сотрудник в Битрикс24<input name="b24" list="b24-list" autocomplete="off" ${!me.b24_enabled ? "disabled" : ""} value="${esc(linked ? linked.name + " · №" + linked.id : user.b24_user_id ? "№" + user.b24_user_id : "")}" placeholder="Не связан — для внешних участников"><datalist id="b24-list">${b24.map(b => `<option value="${esc(b.name)} · №${b.id}">${esc(b.position)}</option>`).join("")}</datalist></label><div class="full actions"><span class="muted">${me.b24_enabled ? "Выберите сотрудника из списка или оставьте поле пустым." : "Битрикс24 не подключён"}</span>${me.b24_enabled ? '<button type="button" id="refresh-b24">Обновить список</button>' : ""}</div><label class="check"><input type="checkbox" name="is_admin" ${user.is_admin ? "checked" : ""}>Администратор</label>${user.id ? `<label class="check"><input type="checkbox" name="active" ${user.active ? "checked" : ""}>Активен</label>` : ""}</div>${errorBox()}<div class="actions"><button type="submit" class="primary">${user.id ? "Сохранить изменения" : "Создать участника"}</button>${user.id ? '<button type="button" id="cancel-edit">Отмена</button>' : ""}</div></form>`;
+      root.querySelector("#user-panel").innerHTML = `<h2>${user.id ? "Изменить участника" : "Новый участник"}</h2><form id="user-form" class="stack"><div class="form-grid"><label>ФИО<input name="fio" required value="${esc(user.fio)}"></label><label>Должность<input name="position" value="${esc(user.position)}"></label><label>Логин<input name="login" required pattern="[A-Za-z0-9._-]{2,40}" maxlength="40" autocomplete="off" value="${esc(user.login)}"><span class="muted">Латиница, цифры, точка, дефис, подчёркивание.</span></label><label>${user.id ? "Новый пароль" : "Пароль"}<span class="password-row"><input name="password" type="text" minlength="6" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" ${user.id ? 'placeholder="Пусто — пароль прежний"' : "required"}><button type="button" id="generate-password">Сгенерировать</button></span><span class="muted">Не менее 6 символов. Пароль виден: передайте его участнику.</span></label><label class="full">Сотрудник в Битрикс24<input name="b24" list="b24-list" autocomplete="off" ${!me.b24_enabled ? "disabled" : ""} value="${esc(linked ? linked.name + " · №" + linked.id : user.b24_user_id ? "№" + user.b24_user_id : "")}" placeholder="Не связан — для внешних участников"><datalist id="b24-list">${b24.map(b => `<option value="${esc(b.name)} · №${b.id}">${esc(b.position)}</option>`).join("")}</datalist></label><div class="full actions"><span class="muted">${me.b24_enabled ? "Выберите сотрудника из списка или оставьте поле пустым." : "Битрикс24 не подключён"}</span>${me.b24_enabled ? '<button type="button" id="refresh-b24">Обновить список</button>' : ""}</div><label class="check"><input type="checkbox" name="is_admin" ${user.is_admin ? "checked" : ""}>Администратор</label>${user.id ? `<label class="check"><input type="checkbox" name="active" ${user.active ? "checked" : ""}>Активен</label>` : ""}</div>${errorBox()}<div class="actions"><button type="submit" class="primary">${user.id ? "Сохранить изменения" : "Создать участника"}</button>${user.id ? '<button type="button" id="cancel-edit">Отмена</button>' : ""}</div></form>`;
       const form = root.querySelector("#user-form");
       if (b24Error) showError(form, b24Error);
       formAction(form, async data => {
@@ -257,6 +263,7 @@ if (typeof document !== "undefined") (() => {
         me = await request("/api/me"); await route();
         const note = document.createElement("p"); note.className = "success"; note.setAttribute("role", "status"); note.textContent = "Участник сохранён."; root.querySelector("#user-panel").prepend(note);
       });
+      root.querySelector("#generate-password").addEventListener("click", () => { form.elements.password.value = generatePassword(); form.elements.password.focus(); });
       root.querySelector("#cancel-edit")?.addEventListener("click", () => edit());
       root.querySelector("#refresh-b24")?.addEventListener("click", async event => {
         event.target.disabled = true;
@@ -411,7 +418,11 @@ if (typeof document !== "undefined") (() => {
   }
   window.addEventListener("hashchange", route);
   window.addEventListener("beforeunload", event => { if (draft?.saver.pending) { event.preventDefault(); event.returnValue = ""; } });
-  window.addEventListener("online", () => { if (me && draft?.saver.pending && draft.owner === me.user.id) draft.saver.flush(); });
+  // Сохранить ответы, пока страница ещё жива: связь вернулась, вкладку свернули или закрывают.
+  const flushDraft = () => { if (me && draft?.saver.pending && draft.owner === me.user.id) draft.saver.flush(); };
+  window.addEventListener("online", flushDraft);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushDraft(); });
+  window.addEventListener("pagehide", flushDraft);
   (async () => {
     try { me = await request("/api/me"); }
     catch (error) { if (!error.status) { root.innerHTML = `<section class="panel">${errorBox()}<button id="retry-start">Повторить</button></section>`; showError(root, error); root.querySelector("#retry-start").onclick = () => location.reload(); return; } }

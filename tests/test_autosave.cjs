@@ -1,7 +1,7 @@
 // Проверяем порядок сохранения и восстановление после сбоя, а не детали DOM.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { DraftSaver } = require('../web/app.js');
+const { DraftSaver, generatePassword, PASSWORD_ALPHABET } = require('../web/app.js');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 test('медленный запрос не затирает более новый ответ; одновременно работает один запрос', async () => {
@@ -92,4 +92,17 @@ test('временная ошибка 500 по-прежнему оставляе
   assert.equal(await saver.flush(), false);
   assert.equal(saver.pending, true);
   assert.equal(saver.closed, null);
+});
+
+test('пароль для участника: 10 читаемых символов без похожих 0/O/o и 1/l/I', () => {
+  for (let i = 0; i < 200; i++) {
+    const password = generatePassword();
+    assert.equal(password.length, 10);
+    assert.match(password, /^[a-zA-Z2-9]{10}$/);
+    assert.doesNotMatch(password, /[0O1lIo]/);
+  }
+  // Каждый символ алфавита достижим: значения случайного источника отображаются на весь алфавит.
+  const all = generatePassword(PASSWORD_ALPHABET.length, n => Uint32Array.from({ length: n }, (_, i) => i));
+  assert.equal(all, PASSWORD_ALPHABET);
+  assert.equal(new Set(PASSWORD_ALPHABET).size, PASSWORD_ALPHABET.length);
 });

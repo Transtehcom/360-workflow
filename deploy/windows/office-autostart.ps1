@@ -36,6 +36,13 @@ try {
     function Keep-Handle { process { $null = $_.Handle; $_ } }
     function Start-App {
         Log "запускаю приложение"
+        # Start-Process перезаписывает журналы: прежние сохраняются рядом, чтобы причина остановки не терялась
+        foreach ($name in "app.out", "app.err") {
+            $current = Join-Path $root "data\$name.log"
+            try {
+                if (Test-Path -LiteralPath $current) { Move-Item -LiteralPath $current -Destination (Join-Path $root "data\$name.prev.log") -Force }
+            } catch { Log "не удалось сохранить прежний журнал ${name}.log: $($_.Exception.Message)" }
+        }
         Start-Process -FilePath $py -ArgumentList ($pyPrefix + @("-u", "manage.py", "run")) -WorkingDirectory $root -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput (Join-Path $root "data\app.out.log") -RedirectStandardError (Join-Path $root "data\app.err.log") | Keep-Handle
     }

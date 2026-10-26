@@ -52,6 +52,9 @@ if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
 suffix = "" if int(sys.argv[3]) == 443 else ":" + str(int(sys.argv[3]))
 server.update(host="127.0.0.1", secure_cookie=True, trust_proxy=True, open_browser=False,
               public_url="https://" + sys.argv[2] + suffix)
+# сервер обычно в UTC, а офис — UTC+5: от пояса зависят «сегодня», сроки и напоминания. Заданный пояс не меняем
+if not config.get("timezone"):
+    config["timezone"] = "Asia/Yekaterinburg"
 path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 print(port)
 PY

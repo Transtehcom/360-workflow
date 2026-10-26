@@ -102,7 +102,8 @@ def _finish(con, op_id):
 
 def _create(con, tasks, public_url, lock, op):
     """Ставит задачу анкеты. Ответственный, оцениваемый и срок — из базы на момент выполнения.
-    Если анкету убрали, пока задача ставилась, возвращает операцию закрытия этой задачи, иначе None."""
+    Если найденную или поставленную задачу некому закрыть (анкету убрали или уже отправили), возвращает
+    операцию её закрытия, иначе None."""
     aid = op["assignment_id"]
     with lock:
         g = con.execute(
@@ -110,8 +111,13 @@ def _create(con, tasks, public_url, lock, op):
             "a.deadline FROM assignments g JOIN users u ON u.id = g.user_id "
             "JOIN assessments a ON a.id = g.assessment_id JOIN users s ON s.id = a.subject_id WHERE g.id=?",
             (aid,)).fetchone()
-        if (not g or g["b24_task_id"] is not None or g["b24_user_id"] is None
-                or g["status"] != "draft" or g["assessment_status"] != "active"):
+        skip = (not g or g["b24_task_id"] is not None or g["b24_user_id"] is None
+                or g["status"] != "draft" or g["assessment_status"] != "active")
+        # анкету отправили или оценку закрыли после неудачной попытки: задача могла поставиться с потерянным
+        # ответом. Новую не ставим, но ищем — найденную надо закрыть
+        adopt = (skip and g is not None and g["b24_task_id"] is None and g["b24_user_id"] is not None
+                 and op["attempts"] > 0)
+        if skip and not adopt:
             # анкету убрали, задача уже есть, связь с Битрикс24 сняли, анкету отправили или оценку закрыли —
             # ставить нечего. Отправка и закрытие без задачи не ставят complete в очередь: поставленную сейчас
             # задачу никто бы не закрыл. Операции за этой завершатся в _task_op как «задачи нет»
@@ -122,6 +128,11 @@ def _create(con, tasks, public_url, lock, op):
     # задача могла поставиться, а ответ — потеряться: сначала ищем её, чтобы не завести вторую
     task_id = tasks.find_task(g["b24_user_id"], title, op["created_at"])
     if task_id is None:
+        if adopt:
+            with lock:
+                _finish(con, op["id"])  # задачи нет — ставить её отправленной или закрытой анкете незачем
+                con.commit()
+            return None
         task_id = tasks.add_task(g["b24_user_id"], title,
                                  task_description(g["subject_fio"], g["deadline"], public_url), g["deadline"])
     with lock:
@@ -129,8 +140,12 @@ def _create(con, tasks, public_url, lock, op):
         stored = con.execute("UPDATE assignments SET b24_task_id=? WHERE id=?", (task_id, aid)).rowcount
         _finish(con, op["id"])
         follow_up = None
-        if not stored:
-            # анкету убрали, пока ставилась задача: закрытие — в очередь той же транзакцией, выполняется сразу
+        # закрытие, поставленное отправкой или закрытием оценки, уже ждёт в очереди и теперь найдёт задачу
+        waiting = adopt and con.execute("SELECT 1 FROM b24_ops WHERE assignment_id=? AND op='complete' "
+                                        "AND done_at IS NULL", (aid,)).fetchone() is not None
+        if not stored or (adopt and not waiting):
+            # анкету убрали, пока ставилась задача, или закрыть найденную некому: закрытие — в очередь той же
+            # транзакцией, выполняется сразу
             follow_up = enqueue(con, aid, "complete", {"task_id": task_id})
         con.commit()
         if follow_up is None:

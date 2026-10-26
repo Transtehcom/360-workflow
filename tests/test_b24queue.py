@@ -193,6 +193,60 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(len(self.fake.tasks), 1)
         self.assertEqual(self.task_id(self.a_peer), next(iter(self.fake.tasks)))
 
+    def lose_add_response(self):
+        """Первый проход: задача в Битрикс24 поставлена, а ответ потерян — create остаётся в очереди."""
+        def lose_response(task_id):
+            self.fake.after_add = None
+            raise B24Error("timeout")
+        self.fake.after_add = lose_response
+        self.assertEqual(self.process(), {"done": 0, "failed": 1})
+        self.assertIsNone(self.task_id(self.a_peer))
+        self.fake.calls.clear()
+        return next(iter(self.fake.tasks))
+
+    def test_lost_response_then_submit_closes_adopted_task(self):
+        task_id = self.lose_add_response()
+        self.submit(self.a_peer, self.petrov)
+        self.assertEqual(self.process(), {"done": 2, "failed": 0})
+        self.assertEqual(self.methods(), ["find_task", "complete"])  # не ставится заново и закрывается один раз
+        self.assertEqual(self.fake.calls[-1], ("complete", task_id))
+        self.assertEqual(self.fake.tasks[task_id]["status"], "closed")
+        self.assertEqual(self.task_id(self.a_peer), task_id)
+        self.assertEqual(self.open_ops(), 0)
+
+    def test_lost_response_then_finish_closes_adopted_task(self):
+        task_id = self.lose_add_response()
+        asm.finish_assessment(self.con, self.aid)
+        self.assertEqual(self.process(), {"done": 3, "failed": 0})
+        self.assertEqual(self.fake.calls, [("find_task", 12, f"Оценка 360°: Иванов Пётр (анкета №{self.a_peer})",
+                                            self.op("create")["created_at"]),
+                                           ("comment", task_id, "Оценка завершена"), ("complete", task_id)])
+        self.assertEqual(self.fake.tasks[task_id]["status"], "closed")
+        self.assertEqual(self.open_ops(), 0)
+
+    def test_failed_create_then_submit_finds_nothing_and_adds_nothing(self):
+        self.fake.fail["add_task"] = 1  # задача не поставилась вовсе
+        self.assertEqual(self.process(), {"done": 0, "failed": 1})
+        self.submit(self.a_peer, self.petrov)
+        self.fake.calls.clear()
+        self.assertEqual(self.process(), {"done": 2, "failed": 0})
+        self.assertEqual(self.methods(), ["find_task"])
+        self.assertEqual(self.fake.tasks, {})
+        self.assertIsNone(self.task_id(self.a_peer))
+        self.assertEqual(self.open_ops(), 0)
+
+    def test_adopted_task_without_queued_complete_gets_one(self):
+        # защитная ветка: закрытия в очереди нет — оно ставится той же транзакцией и выполняется в этом проходе
+        task_id = self.lose_add_response()
+        self.submit(self.a_peer, self.petrov)
+        self.con.execute("DELETE FROM b24_ops WHERE op='complete'")
+        self.con.commit()
+        self.assertEqual(self.process(), {"done": 2, "failed": 0})
+        self.assertEqual(self.methods(), ["find_task", "complete"])
+        self.assertEqual(json.loads(self.op("complete")["payload"]), {"task_id": task_id})
+        self.assertEqual(self.fake.tasks[task_id]["status"], "closed")
+        self.assertEqual(self.open_ops(), 0)
+
     def test_ops_wait_for_create(self):
         asm.set_deadline(self.con, self.aid, day(20))
         self.fake.fail["add_task"] = 1
